@@ -6,10 +6,70 @@ For schema details, table descriptions, and the connection recipe, see [data-mod
 
 ---
 
+## 0. Crystal's actual report formats (working spreadsheets in this folder)
+
+Eight working spreadsheets exported from Intellidealer (May 2026) reveal the exact reporting structure Crystal already uses. These are the report shapes we should target with MCP tools, dashboards, and agent outputs — they're what the business reads today.
+
+### Reports inventory
+
+| Spreadsheet | Type | Shape | What it shows |
+|-------------|------|-------|---------------|
+| [Cash Today Summary.xlsx](Cash%20Today%20Summary.xlsx) | Chain-wide cash snapshot | 34 rows × 3 cols | Cash in Bank, Contracts in Transit, Vehicle A/R, **TOTAL CASH EQUIVALENTS**, New/Used Inventory, New Floor Plan, NEW NET EQUITY, Trade Payoffs, **NET CASH POSITION**, Factory Receivables |
+| [Cash Detail.xlsx](Cash%20Detail.xlsx) | Cash detail by account | 73 rows × 3 cols | Account-by-account cash balances (Seacoast, PNC, Ameris, Financed Clearing, etc.) — one row per bank account with Co/CC composite ID |
+| [Balance Sheet Summary.xlsx](Balance%20Sheet%20Summary.xlsx) | BS by location (summary) | 55 rows × 3 cols | Standard Assets / Liabilities / Equity sections, single column per location header. Example file is `TALLAHASSEE`. |
+| [Balane Sheet Detail.xlsx](Balane%20Sheet%20Detail.xlsx) | BS by location (detail) | **32,542 rows** × 3 cols | Account-level detail underneath each BS line. Filename has a typo (*Balane*). |
+| [Income Statement Summary.xlsx](Income%20Statement%20Summary.xlsx) | Departmental P&L (summary) | 84 rows × **20 cols** | 6-department layout: **Sales \| Service \| Parts \| Rental Dept \| Total Fixed \| Admin** with %, Current Month, Prior Month, Change, YTD, % columns. Standard Kubota DFS shape. |
+| [Income Statement Detail.xlsx](Income%20Statement%20Detail.xlsx) | Departmental P&L (detail) | **8,727 rows** × 20 cols | Same column structure, account-level rows underneath each P&L line. |
+| [Sales and Gross Summary.xlsx](Sales%20and%20Gross%20Summary.xlsx) | Branch × brand revenue | 160 rows × **43 cols** | **18 branches** across the columns, ~30+ equipment brands across the rows (Kubota, Mahindra, Takeuchi, JCB, Bobcat, Sany, Wacker Neuson, …) — revenue / COGS / margin per brand-branch combination. |
+| Sales and Gross Detail.xls | Account-level sales detail | (older `.xls` format, 4.5 MB) | Per-document detail underneath the summary; probably one row per equipment unit sold. |
+
+### What these artifacts reveal about Crystal
+
+1. **18 retail branches**, not a single dealership. Branch names: *Deland, Leesburg, Parts Warehouse, Chiefland, Spring Hill, Ocala, Homosassa, Hastings, Palatka, Starke, Live Oak, Madison, Panama City, Tallahassee, Cairo, Jacksonville, Lecanto, Dothan*. Plus rolled-up totals: *Total Tractor, Total 00-09, Total 10-19*. Reports come in **per-branch flavors** as well as chain-wide.
+2. **Multi-brand dealership**, not Kubota-only. Brands tracked separately in the Sales & Gross report: Kubota (primary), Mahindra, Takeuchi, JCB, Bobcat, Sany Compact, Sany Large, Wacker Neuson, and ~20 more.
+3. **Standard 6-department P&L structure**: `Sales | Service | Parts | Rental Dept | Total Fixed | Admin`. *Total Fixed* is a subtotal of Service+Parts+Rental (the "Fixed Operations" recurring side of the business). This matches the **Kubota Dealer Financial Statement (DFS)** layout — Crystal almost certainly submits this same format to Kubota corporate.
+4. **Detailed expense taxonomy.** The IS detail uses Crystal's full chart of accounts:
+   - *Variable Expense* (one bucket)
+   - *Personnel Expense*: Owners Compensation, Supervisory Compensation, Clerical Compensation, Other Salaries, Absentee Compensation, Payroll Taxes, Employee Benefits
+   - *Semi-Fixed Expenses*: Company Vehicle Expenses, Transportation Credits, Other Supplies, Advertising, Policy Work, Data Processing, Outside Services, Telephone, Training Expense, Interest Floorplan, Interest Other, Other Semi-Fixed
+   - *Fixed Expenses*: Rent, Amortization, Repairs-Buildings, Depreciation-Building, RE Taxes, Insurance, Mortgage Interest, Utilities, Other Taxes, Repairs-Equipment, Depreciation-Equipment, Other Fixed
+   - *Operating Income → Other Income/Deductions → Net Income*
+5. **Three columns Crystal expects in any P&L view**: Current Month, Prior Month (comparative), Year-to-Date.
+6. **Crystal's BS treats branches as cost centers**, not standalone entities. The example Tallahassee BS shows TOTAL ASSETS = **−$145K** and `Due from Affiliates` = **−$4.2M** — only makes sense as a sub-unit operating through intercompany. **Whatever BS tool we build needs to support this branch-level view, not just a consolidated entity-level BS.**
+
+### Implications for MCP tool design
+
+These artifacts give us the exact target shapes for the high-value tools. Plan to add:
+
+| MCP tool | Mirrors this report | Notes |
+|----------|---------------------|-------|
+| `cash_today_summary()` | [Cash Today Summary.xlsx](Cash%20Today%20Summary.xlsx) | Chain-wide cash position card |
+| `cash_detail(company?, branch?)` | [Cash Detail.xlsx](Cash%20Detail.xlsx) | Bank-account-level rollforward |
+| `balance_sheet(branch?, period)` | [Balance Sheet Summary.xlsx](Balance%20Sheet%20Summary.xlsx) | Per-branch BS; support `branch=None` for consolidated |
+| `balance_sheet_detail(branch?, period)` | [Balane Sheet Detail.xlsx](Balane%20Sheet%20Detail.xlsx) | Account-level drill-down |
+| `income_statement_dept(period, branch?, comparative?)` | [Income Statement Summary.xlsx](Income%20Statement%20Summary.xlsx) | 6-dept layout with Current/Prior/YTD columns |
+| `income_statement_detail(period, branch?, dept?)` | [Income Statement Detail.xlsx](Income%20Statement%20Detail.xlsx) | Account rows under each dept |
+| `sales_and_gross(period, branch?, brand?)` | [Sales and Gross Summary.xlsx](Sales%20and%20Gross%20Summary.xlsx) | Brand × Branch revenue/COGS/margin grid |
+| `kubota_dfs(period)` | [Income Statement Summary.xlsx](Income%20Statement%20Summary.xlsx) (alias) | Same data, framed as the Kubota DFS submission |
+
+Each of these is a deterministic SQL aggregation over the existing replica — no new ETL needed.
+
+### Open question — data freshness in the spreadsheets
+
+These spreadsheets were generated **on or near 2026-05-22** (file timestamps) and show YTD numbers consistent with **data through April 2026**. The Income Statement Summary explicitly labels the comparative column `PRIOR MO (Apr26-Apr26)`. But our GL replica's most recent period is **January 2026** (see [data-model.md](data-model.md#etl--dboacctloadcontrol)).
+
+That means either:
+- Crystal has closed Feb / Mar / Apr 2026 in Intellidealer **since our last ETL run (2026-05-14)**, so a fresh ETL invocation would pull them, OR
+- These spreadsheets were generated from a different Intellidealer instance / snapshot we're not replicating.
+
+Worth confirming — if the AS/400 source now has data through April, **re-running the AcctLoadControl pipeline should bring the replica current** without any code changes.
+
+---
+
 ## 1. Core Financial Statements
 
-- **★ Income Statement (P&L)** — by period, YTD, with prior-year comparison. `v_IncomeStatementLines` grouped by `Section` / `SectionOrder`.
-- **★ Balance Sheet** — period-end snapshot. Asset / Liability / Equity accounts (filter by `ACCMAST.ACTYP`), with comparative columns (current vs prior month, vs prior year-end).
+- **★ Income Statement (P&L) — Kubota DFS format** — the 6-department layout (`Sales | Service | Parts | Rental | Total Fixed | Admin`) with `Current Month | Prior Month | YTD` columns. Mirrors [Income Statement Summary.xlsx](Income%20Statement%20Summary.xlsx). The detail variant ([Income Statement Detail.xlsx](Income%20Statement%20Detail.xlsx)) drops account-level rows under each dept.
+- **★ Balance Sheet — by branch** — Crystal runs BS at the branch level, not just consolidated; the per-branch view shows intercompany via `Due from Affiliates` (often a large negative for satellite branches). Mirrors [Balance Sheet Summary.xlsx](Balance%20Sheet%20Summary.xlsx) (summary) and [Balane Sheet Detail.xlsx](Balane%20Sheet%20Detail.xlsx) (account-level). Need a `branch=None` mode for consolidated.
 - **★ Trial Balance** — every active account with period-end balance. Sanity check: debits = credits.
 - **Statement of Retained Earnings** — beginning RE + net income − distributions = ending RE.
 - **Statement of Cash Flows (indirect)** — derived from net income + non-cash + working-capital changes.
@@ -31,12 +91,14 @@ For schema details, table descriptions, and the connection recipe, see [data-mod
 
 ## 3. Departmental / Profit-Center Reporting
 
-- **★ P&L by Division** — separates dealership business lines (parts, service, wholegoods, rental).
-- **P&L by Cost Center** — finer-grained than division (the `CC` dimension across GLCAL / DEPTMAST / COACMAST).
+Crystal's actual departmental structure (from [Income Statement Summary.xlsx](Income%20Statement%20Summary.xlsx)): **Sales · Service · Parts · Rental · Total Fixed (= Service + Parts + Rental) · Admin**. Build tools against this exact taxonomy.
+
+- **★ P&L by Department** — the 6-bucket Kubota DFS layout (see Section 1).
+- **★ Branch scorecard (all 18 locations)** — revenue, gross margin, opex, net by branch. Branch list: Deland, Leesburg, Parts Warehouse, Chiefland, Spring Hill, Ocala, Homosassa, Hastings, Palatka, Starke, Live Oak, Madison, Panama City, Tallahassee, Cairo, Jacksonville, Lecanto, Dothan. Use `v_IncomeStatementLines.Branch`.
+- **P&L by Cost Center** — finer-grained than department (the `CC` dimension across GLCAL / DEPTMAST / COACMAST).
 - **Departmental contribution margin** — revenue − direct costs by department.
-- **Branch / location scorecard** — revenue, gross margin, opex, net by branch (`v_IncomeStatementLines.Branch`).
 - **Cross-division allocation analysis** — overhead pushed between departments.
-- **Department comparison matrix** — every department side-by-side for the same period.
+- **Department × Branch matrix** — every department side-by-side across every branch for the same period (full Crystal scorecard).
 
 ---
 
@@ -53,10 +115,13 @@ For schema details, table descriptions, and the connection recipe, see [data-mod
 
 ## 5. Dealer-Specific Operational Reports
 
-This is where Crystal's business (Kubota / CNH dealer) shows up:
+Crystal is a **multi-brand equipment dealer** across 18 retail locations. From [Sales and Gross Summary.xlsx](Sales%20and%20Gross%20Summary.xlsx) the tracked brands include: **Kubota (primary), Mahindra, Takeuchi, JCB, Bobcat, Sany Compact, Sany Large, Wacker Neuson**, and ~20 more (123 row labels total). Tools should support `brand` as a top-level dimension alongside branch.
 
-- **★ Wholegoods inventory turns** — Inventory of Wholegoods (acct `12000`, alias `F231`) balance trend vs Cost of New Equipment Sold. Days-on-lot.
-- **★ Equipment sales performance** — New vs Used; Kubota vs CNH; revenue, COGS, gross margin per unit category.
+- **★ Sales and Gross by brand × branch** — the YTD revenue / COGS / gross margin matrix from [Sales and Gross Summary.xlsx](Sales%20and%20Gross%20Summary.xlsx). 18 branches × ~30 brands. Detail variant: per-unit account-level from [Sales and Gross Detail.xls](Sales%20and%20Gross%20Detail.xls).
+- **★ Wholegoods inventory turns** — Inventory of Wholegoods (acct `12000`, alias `F231`) balance trend vs Cost of New Equipment Sold. Days-on-lot. [Cash Today Summary.xlsx](Cash%20Today%20Summary.xlsx) tracks `NEW/USED TRACTORS` ($46.9M) and `NEW FLOOR PLAN` (-$38.4M) as headline numbers.
+- **★ Floorplan / Net Equity card** — *NEW NET EQUITY* = inventory − floor plan. Crystal tracks this prominently on [Cash Today Summary.xlsx](Cash%20Today%20Summary.xlsx) ($8.55M as of late-April-2026). Plus `NET CASH POSITION` ($14.2M).
+- **★ Cash position snapshot** — chain-wide: Cash in Bank + Contracts in Transit + Vehicle A/R = TOTAL CASH EQUIVALENTS. Mirrors [Cash Today Summary.xlsx](Cash%20Today%20Summary.xlsx).
+- **★ Equipment sales performance** — New vs Used; per brand; revenue, COGS, gross margin per unit category. Crystal's blended Kubota margin runs ~11% based on the current YTD numbers ($14.2M margin / $130M Kubota revenue).
 - **★ Parts department metrics** — parts inventory turn, parts COGS vs parts revenue, parts margin %.
 - **★ Service department labor recovery** — labor sold vs labor cost; effective billing rate; technician utilization (financial proxy).
 - **★ Rental fleet performance** — rental revenue vs rental depreciation (`CA_GLWA` accounts) vs net book value.
@@ -65,7 +130,8 @@ This is where Crystal's business (Kubota / CNH dealer) shows up:
 - **Inventory accrual aging** — `CA_IAA` (inventory accrual account) balance over time; should clear within N days of receipt.
 - **Used equipment write-down exposure** — used inventory balance vs market.
 - **CNH alias rollup** — accounts grouped by `CA_CNHA` for CNH dealer reporting.
-- **Kubota DFS-format report** — alias-grouped P&L matching Kubota's dealer financial statement layout (`CA_GLFA`).
+- **Kubota DFS-format report** — the 6-dept P&L matching [Income Statement Summary.xlsx](Income%20Statement%20Summary.xlsx). Crystal almost certainly submits this format to Kubota corporate periodically.
+- **Per-brand DFS** — same Kubota DFS shape but filtered to each manufacturer (Mahindra, JCB, Takeuchi, etc.) for parallel reporting to other OEMs.
 
 ---
 
