@@ -417,17 +417,19 @@ So a COACMAST row is partly dimensional (defining the chart of accounts), partly
 
 Every numeric balance in the replica — GLCAL, GLFIS, DEPTMAST, and COACMAST's balance fields — is a different aggregation of journal-line activity. That activity lives in **`YTDJRL` (Year-to-Date Journals)** on the Intellidealer AS/400 source, per the official **Intellidealer 6.0 System Flowchart** ([`docs/Intellidealer system flow chart.pdf`](Intellidealer%20system%20flow%20chart.pdf)). `YTDJRL` is the canonical posting table — every sub-system (sales, A/P, work orders, payroll, inventory) flows into it, and from there it aggregates into GLCAL / GLFIS / DEPTMAST / COACMAST.
 
-**`YTDJRL` is NOT replicated to acctdata** (and also not in IntelliDealerR1 — verified 2026-05-31). This is the single gap that, when closed, gives us monthly grain for any period (closed or unclosed) and JE-level audit trail in one step.
+**`YTDJRL` is now replicated to acctdata as of 2026-05-31** (801K rows, append-only, YJ_UID watermarked). See [journal-line-etl-spec.md](journal-line-etl-spec.md) for the deployed pattern and the five reconciliation tests; [sql/11_ytdjrl_deployed.sql](../sql/11_ytdjrl_deployed.sql) for the table/proc DDL.
 
 ```
    ┌──────────────────────────────────────────────────────────────────────┐
-   │  YTDJRL  on Intellidealer source — CANONICAL JOURNAL-LINE TABLE      │
+   │  dbo.YTDJRL  (replicated from PFWF0125.YTDJRL on the AS/400)          │
+   │  CANONICAL JOURNAL-LINE TABLE                                         │
    │  Per Intellidealer 6.0 System Flowchart (CDK Global, 2019)           │
    │  Sits next to GLCAL / GLFIS / SUBLED in the GL module                │
    │  Receives postings from every sub-system; aggregates into GLCAL      │
    │                                                                      │
-   │  ✗ NOT replicated to acctdata or IDR1 as of 2026-05-31                │
-   │  → see docs/journal-line-etl-spec.md for the one-table replication    │
+   │  ✓ Deployed 2026-05-31 — append-only, YJ_UID watermark               │
+   │  ✓ P&L reconciles to GLCAL exactly for any closed period             │
+   │  ✓ Unlocks monthly grain inside unclosed periods                     │
    └─────────────────────────────────┬────────────────────────────────────┘
                                       │
                                       │  per posting: Co, Div, CC, Acct,
@@ -458,11 +460,11 @@ Three consequences fall out of this structural model:
 
 2. **The overlap structure** (GLCAL ⊂ CA_YTD ⊂ CA_CUR, and DEPTMAST in lock-step with GLCAL) isn't a quirk — it's the inevitable shape of multiple aggregations over the same input. The "pick one source per statement" rule works because each of the four is *complete* for its grain; there's no information you'd gain by combining them.
 
-3. **The monthly-resolution floor is set by the rollup tables' own granularity.** Since no rollup table is finer than monthly (and none has rows for unclosed periods), we can't answer "March 2026 alone" — not because the data doesn't exist on the source, but because every rollup we have aggregates that month away. Only the journal-line table can break the floor.
+3. **The monthly-resolution floor used to be set by the rollup tables' own granularity** — every rollup we had aggregated detail away, so questions like "March 2026 monthly P&L" couldn't be answered from the replica. With YTDJRL now in place, the floor is broken: any per-day, per-account, per-CC question is answerable directly from `dbo.YTDJRL`.
 
-### What this implies for the gap
+### What this used to imply for the gap — now closed
 
-The "structural" version of the ETL ask: *"We have four aggregation tables over an input we don't see. We want the input."* That single missing table unlocks the grain of all four downstream tables simultaneously — it's not a one-feature ask, it's a foundation ask.
+The "structural" version of the ETL ask used to be: *"We have four aggregation tables over an input we don't see. We want the input."* `YTDJRL` (deployed 2026-05-31) is that input. The rollup tables remain the right source for everything they're already good at (closed-period reporting, fast aggregates); `YTDJRL` is the source for everything they couldn't answer (monthly grain inside unclosed periods, JE-level audit, per-transaction drill-down).
 
 ACCMAST follows the same pattern in miniature: it's a pure dimension (no aggregates), and its closest "rollup" sibling is `v_IncomeStatementLines`, which is a *view* over GLCAL + ACCMAST that the replica builds (also derived from the same hidden stream by extension).
 
@@ -483,10 +485,11 @@ ACCMAST follows the same pattern in miniature: it's a pure dimension (no aggrega
 | `dbo.DEPTMAST` | 4,906 | Wide 24-bucket rollup (current + prior year) |
 | `dbo.GLCAL` | 193,619 | Atomic monthly balances |
 | `dbo.GLFIS` | 17,367 | Annual rollup with month buckets |
+| `dbo.YTDJRL` | 801,685 (as of 2026-05-31, growing) | **Journal-line postings** — append-only, watermarked by `YJ_UID`. Canonical posting source; everything else above is an aggregation of this |
 | `dbo.v_IncomeStatementLines` | 153,900 | Pre-joined reporting view over GLCAL + ACCMAST (P&L only) |
 | `dbo.AcctLoadControl` | run log | One row per ETL run per table |
-| `dbo.AcctSnapshotControl` | 2 | One row per snapshotted table (GLCAL, GLFIS) — watermarks |
-| `stg.ACCMAST` / `COACMAST` / `DEPTMAST` / `GLCAL` / `GLFIS` | same as dbo | Transient staging — populated from source by ADF, then merged into `dbo`. Currently holds last run's data; not authoritative. |
+| `dbo.AcctSnapshotControl` | 2 | One row per snapshotted table (GLCAL, GLFIS) — watermarks. YTDJRL is append-only and intentionally not snapshotted |
+| `stg.ACCMAST` / `COACMAST` / `DEPTMAST` / `GLCAL` / `GLFIS` / `YTDJRL` | same as dbo | Transient staging — populated from source by ADF, then merged (or inserted, for YTDJRL) into `dbo`. Currently holds last run's data; not authoritative. |
 | `snap.GLCAL` | 4,906 (1 snapshot date so far) | Sparse change-capture snapshots — only contains rows that changed between ETL runs |
 | `snap.GLFIS` | (sparse) | Same pattern for annual rollup |
 
@@ -542,7 +545,7 @@ The replica also captures **sparse historical snapshots** of GLCAL and GLFIS —
 - **One row per `(SnapshotDate, PK)`.** If the same row changes twice in the same Eastern day, only the latest state survives in `snap.GLCAL` for that day (MERGE updates rather than appending).
 - **Same grain as the source table.** `snap.GLCAL` rows are still keyed by `GB_DATE` (monthly); `snap.GLFIS` by `GF_YR`. Snapshots add a *time axis on top of* the existing grain — they don't unlock sub-monthly detail.
 - **Use cases.** Detect late-posted adjustments to closed periods; reconstruct "what did Feb 2026's balance look like a month ago?"; track when year-end close-to-RE entries actually posted.
-- **Not a substitute for the missing journal-line table.** See [§ "Structural model"](#structural-model--hybrid-masters-and-the-hidden-transaction-stream) and [reporting-catalog.md Tier 3](reporting-catalog.md#tier-3--truly-missing-need-separate-sourcing-or-not-in-our-environment).
+- **Complementary to YTDJRL, not a substitute for it.** Snapshots tell you "what did GLCAL `202602` look like as of 2026-05-15 vs. today?" YTDJRL tells you "what individual postings make up that period." Different questions, both useful. See [§ "Structural model"](#structural-model--hybrid-masters-and-the-hidden-transaction-stream).
 
 ### Reporting view — `dbo.v_IncomeStatementLines`
 
