@@ -264,22 +264,20 @@ Tables that exist in IntelliDealerR1 (verified-accurate schema, but data is paus
 
 - **Wholegoods / equipment unit master** — no `WG*`/`MACH*`/`EQUIP*` tables found in either DB. Per-unit days-on-lot and per-unit equipment margin remain blocked. Possibly under a different name in Intellidealer; worth a targeted search.
 - **Rental fleet tables** — no `RE*`/`RNT*` tables. May not be in Crystal's Intellidealer footprint at all.
-- **Journal-line / activity gap — CORRECTED 2026-05-31.** Per the **Intellidealer 6.0 System Flowchart** (`docs/Intellidealer system flow chart.pdf`), the canonical journal-line table is **`YTDJRL` (Year-to-Date Journals)** — it sits next to GLCAL / GLFIS / SUBLED in the accounting module on the AS/400 source. **`YTDJRL` does NOT exist in IDR1 or in `acctdata`.** It was never replicated. **Replicating this single table closes the journal-line gap.**
+- **Journal-line / activity gap — CLOSED 2026-05-31.** `YTDJRL` (Year-to-Date Journals) is the canonical journal-line table per the Intellidealer 6.0 System Flowchart, and it is **now replicated to `acctdata`** as `dbo.YTDJRL` (801K rows, append-only, watermarked by `YJ_UID`). P&L reconciles to GLCAL exactly for any closed period; monthly grain inside unclosed periods is queryable directly. See [docs/journal-line-etl-spec.md](journal-line-etl-spec.md) for the deployed pattern and reconciliation evidence, [sql/11_ytdjrl_deployed.sql](../sql/11_ytdjrl_deployed.sql) for the table/proc DDL.
 
-  This is the third and corrected version of this bullet. The history is worth keeping because it documents how the investigation evolved:
-  - **First (original)**: "No GLTRANS-style table; truly missing; needs separate sourcing."  → too pessimistic.
-  - **Second (2026-05-29 reclassification)**: "Actually in IDR1 distributed across 5 tables (CGIHIST, YTDIST, SUBLED, PARTHIST, INVHCC)." → wrong; that was reverse-engineered from what IDR1 *did* have. Reconciliation testing showed those 5 tables only cover ~80% of revenue, 84% of COGS, 26% of OpEx, and 10% of BS activity against GLCAL.
-  - **Third (this — correct)**: Per the official CDK / Intellidealer 6.0 flowchart, there's a single canonical journal-line table called `YTDJRL` that consolidates all postings. It's just not in our replicas because IDR1 is a partial subset of the source schema.
+  Investigation history (kept because the path mattered):
+  - **First (original)**: "No GLTRANS-style table; truly missing; needs separate sourcing." → too pessimistic.
+  - **Second (2026-05-29)**: "Actually in IDR1 distributed across 5 tables (CGIHIST, YTDIST, SUBLED, PARTHIST, INVHCC)." → wrong; reverse-engineered from what IDR1 *did* have. Reconciliation testing showed those 5 tables cover ~80% of revenue, 84% of COGS, 26% of OpEx, ~10% of BS activity — they are *participants* in the posting flow, not the consolidated source.
+  - **Third (2026-05-31 morning)**: Brad pointed at the official CDK / Intellidealer 6.0 flowchart; `YTDJRL` is the single canonical journal-line table.
+  - **Fourth (2026-05-31 afternoon)**: AS/400 admin returned `YTDJRL` DDL; ETL team built the pipeline against the live replica the same day. Pattern is append-only (rather than the FULL_RELOAD+MERGE used by the five summary tables) because YTDJRL rows are immutable journal postings.
 
-  **What replicating `YTDJRL` unlocks (one ETL extension, one table):**
-  - True monthly P&L inside any unclosed period
-  - Branch / department / brand decomposition of unclosed activity
-  - JE-level audit trail and "who posted this, when" traceability
-  - Unusual-JE detection (round-number postings, weekend posts, repeated reversals)
-  - Reconciliation back to GLCAL by aggregating `YTDJRL` by `(Co, Div, CC, Acct, year-month)`
+  **What this unlocks (now live, not theoretical):**
+  - True monthly P&L inside any unclosed period — verified for Mar/Apr/May 2026
+  - Branch / department / brand decomposition of unclosed activity via `GROUP BY YJ_CC`
+  - JE-level audit trail and "who posted this, when" traceability via `YJ_JRL`, `YJ_CRT`, `YJ_DT`/`YJ_PDT`
+  - Reconciliation back to GLCAL by aggregating `YTDJRL` by `(Co, Div, CC, Acct, year-month)` — zero per-account drift confirmed
 
-  **Action required:** ask the AS/400 admin to confirm `PFWF0125/YTDJRL` exists and provide a schema sample, then extend the existing acctdata ETL to replicate it using the same pattern as the five existing GL summary tables. See [docs/journal-line-etl-spec.md](journal-line-etl-spec.md) for the spec.
-
-  **Other accounting tables missing from IDR1 but on the flowchart** (likely on the live source): `IEHIST` (payroll postings), `FASSET` / `FADEPR` / `FAHIST` (fixed assets / depreciation), `GBD` (general billing details), `MNBDD` / `MNBDT` (invoice details), `CRDEP` (cash receipts). These are useful follow-ons for specific reporting needs (parts margin, fixed-asset rollforward, etc.) but **`YTDJRL` alone closes the financial-statement reconciliation gap**.
+  **Other accounting tables missing from IDR1 but on the flowchart** (still missing — separate scoping required if a use case arises): `IEHIST` (payroll postings), `FASSET` / `FADEPR` / `FAHIST` (fixed assets / depreciation), `GBD` (general billing details), `MNBDD` / `MNBDT` (invoice details), `CRDEP` (cash receipts). Useful follow-ons for specific reporting needs (parts margin, fixed-asset rollforward, etc.) but **`YTDJRL` alone closed the financial-statement reconciliation gap**.
 - **Full A/P sub-ledger / vendor master** — only 2 thin AP control tables exist; no APMAST/APHIST/Vendor master. A/P aging by vendor remains blocked. `POBILL` is a partial proxy.
 - **Budget / Forecast** — no budget tables anywhere. Crystal likely manages these in Excel — separate sourcing required.

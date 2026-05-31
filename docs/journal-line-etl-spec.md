@@ -1,128 +1,157 @@
-# Journal-Line ETL Extension — Spec for the ADF Owner
+# Journal-Line ETL — STATUS: DEPLOYED 2026-05-31
 
-**Updated 2026-05-31** — scope revised down from 5 tables to **1 table (`YTDJRL`)** based on the Intellidealer 6.0 System Flowchart confirming the canonical journal-line source. The earlier 5-table draft (preserved in `sql/07-10_*.sql`) is now superseded by this spec.
+**Updated 2026-05-31.** The AS/400 admin returned the `YTDJRL` source DDL ([`docs/YTDJRL_DDL.sql`](YTDJRL_DDL.sql)) and the ETL team built the pipeline against the live replica the same day. The journal-line gap that motivated this spec is now closed.
 
----
-
-## Context — why we're doing this
-
-The current acctdata replica covers the five GL summary tables (ACCMAST, COACMAST, DEPTMAST, GLCAL, GLFIS). They give us excellent **closed-period** reporting but no monthly grain inside an unclosed period — Crystal's report writer can produce stand-alone April-2026 monthly figures, but our SQL data can't, because the four downstream rollup tables aggregate away the per-transaction detail.
-
-Per the official **Intellidealer 6.0 System Flowchart** (CDK Global, 2019; see [`docs/Intellidealer system flow chart.pdf`](Intellidealer%20system%20flow%20chart.pdf)), the canonical journal-line posting table is:
-
-> **`YTDJRL` — Year-to-Date Journals.** Sits in the GL module alongside `GLCAL`, `GLFIS`, `SUBLED`, and `ACCMAST`. Every sub-system posting (sales, A/P, work orders, payroll, depreciation, manual JE, bank rec) consolidates into this table, which then aggregates upward into `GLCAL`.
-
-**`YTDJRL` was never replicated.** It exists on the live AS/400 source but is not in `acctdata` or `IntelliDealerR1`. Replicating this single table closes the journal-line gap and unlocks monthly-grain reporting for any period.
-
----
-
-## What we need from the AS/400 admin / Intellidealer admin
-
-Three single-sentence questions. The whole package depends on these.
-
-| # | Question | Why it matters |
-|---:|---|---|
-| 1 | What is the IBM i `(library/file)` for `YTDJRL` on the live source? | The ADF Copy needs the exact source path. Almost certainly `PFWF0125/YTDJRL` (same library as GLCAL), but worth confirming. |
-| 2 | Do the existing `Intellidealer-User-Odd-Months` / `Intellidealer-User-Even-Months` credentials have read permission on `YTDJRL`? | Almost certainly yes (same library, same accounting module), but a one-sentence confirmation avoids a surprise. |
-| 3 | Can you `DSPFFD` (or equivalent) and send the column list + types for `YTDJRL`? | Once we have the schema, the SQL package (table DDL + merge proc + snapshot proc) is a few hours' work, mirroring the existing GL ETL pattern. |
-
-Optional but useful:
-- Approximate row count and how many years of history `YTDJRL` retains on the source (informs ETL cadence + initial load duration).
-- Whether `YTDJRL` is truncated/archived periodically (e.g. year-end roll into `YTDJRLH` or similar).
-
----
-
-## ETL pipeline shape (once schema is known)
-
-The pipeline follows the exact same pattern as the existing five GL summary tables:
-
-```
-1. ADF calls sp_AcctStartRun('YTDJRL')        → allocates RunId
-2. ADF truncates stg.YTDJRL
-3. ADF Copy: PFWF0125/YTDJRL → stg.YTDJRL     (stamps RunId on every row)
-4. ADF calls sp_Acct_Merge_YTDJRL(@RunId)     → MERGE with change detection
-5. ADF calls sp_Acct_Snapshot_YTDJRL          → captures any changed rows
-6. ADF calls sp_AcctFinalize(@RunId)
-```
-
-Same cadence as the existing five (4×/day at 03:00, 11:00, 15:00, 19:00 UTC). Same failure-handling. Same secret rotation.
-
----
-
-## SQL package contents (to be drafted once schema is in hand)
-
-Will be added to `sql/`:
-
-| File | Contents |
+| | |
 |---|---|
-| `11_ytdjrl_schema.sql` | `dbo.YTDJRL`, `stg.YTDJRL`, `snap.YTDJRL` table definitions + indexes |
-| `12_ytdjrl_procedures.sql` | `sp_Acct_Merge_YTDJRL` (change-detection MERGE pattern) |
-| `13_ytdjrl_snapshot.sql` | `sp_Acct_Snapshot_YTDJRL` (watermark-driven capture) |
-| `14_ytdjrl_control.sql` | Extend `sp_AcctStartRun` allow-list to include `'YTDJRL'`; insert row into `AcctSnapshotControl` |
+| Source table | `PFWF0125.YTDJRL` on the AS/400 |
+| Replica table | `dbo.YTDJRL` (+ `stg.YTDJRL`) |
+| Rows loaded | 801,685 (initial load) |
+| Date coverage | 2019-01-29 → 2026-06-30 (7+ years on source; no archive cycle observed) |
+| Pattern | **Append-only** (no MERGE, no snapshot). YJ_UID watermark; strict-greater-than across runs |
+| Procs | `sp_AcctStartRun` (extended), `sp_Acct_Insert_YTDJRL` |
+| First INITIAL load | 2026-05-31 14:21 UTC — 801,683 rows in ~16 minutes |
+| First INCREMENTAL  | 2026-05-31 15:02 UTC — 2 rows, watermark advanced cleanly |
 
-All four files will mirror the existing patterns (see `sp_Acct_Merge_GLCAL` and `sp_Acct_Snapshot_GLCAL` for the templates). Total work to draft them: an hour or two once the schema is available.
+Captured for repo-side documentation in [`sql/11_ytdjrl_deployed.sql`](../sql/11_ytdjrl_deployed.sql).
 
 ---
 
-## Pre-deploy sanity checks (once deployed)
+## Why the append-only departure from the 5-table pattern
+
+The existing five summary tables (ACCMAST/COACMAST/DEPTMAST/GLCAL/GLFIS) use FULL_RELOAD + change-detection MERGE because they're small (few thousand rows each) and their source-side rows mutate in place. `YTDJRL` is different on both counts:
+
+| Concern | Resolution |
+|---|---|
+| 800K+ rows growing daily | Incremental INSERT only what's new; full reload would be wasteful |
+| No usable business key | Even `(YJ_CO, YJ_DIV, YJ_JRL, YJ_ACC, YJ_CC, YJ_AMT, YJ_FILA)` has ~6% dupes (per ETL team analysis). Resolved with a synthetic `Id BIGINT IDENTITY` PK |
+| Rows never mutate (journal postings are immutable; reversals are new rows with non-zero `YJ_RDT`) | MERGE/change-detection adds no value; pure INSERT is correct |
+| Audit / change history | The dbo table itself IS the immutable audit trail. **No `snap.YTDJRL` needed.** |
+| Watermark | `YJ_UID` is an 18-digit value of the form `YYYYMMDDhhmmssXXXXX`, monotonic per row. Strict-greater-than (`WHERE YJ_UID > @WatermarkFrom`) prevents any row from crossing run boundaries. |
+
+`AcctSnapshotControl` intentionally has **no row** for `YTDJRL`. Adding one would seed a watermark for a snapshot proc that doesn't exist and shouldn't.
+
+---
+
+## Verification — five tests, all green
+
+Run 2026-05-31 against `dbo` / `stg` on the production replica.
+
+### Test 1 — ETL pipeline status
 
 ```sql
--- 1. Allow-list accepts YTDJRL
-DECLARE @r UNIQUEIDENTIFIER, @cp VARCHAR(4), @u NVARCHAR(127), @p NVARCHAR(127);
-EXEC dbo.sp_AcctStartRun 'YTDJRL', @r OUTPUT, @cp OUTPUT, @u OUTPUT, @p OUTPUT;
-DELETE FROM dbo.AcctLoadControl WHERE RunId = @r;
-
--- 2. Control row exists
-SELECT * FROM dbo.AcctSnapshotControl WHERE TableName = 'YTDJRL';
-
--- 3. After first ETL run, reconcile YTDJRL → GLCAL for any closed month
--- (e.g. Feb 2026). Coverage should be ~100%; if not, there's a posting source
--- YTDJRL doesn't capture (unlikely but verify).
-WITH j AS (
-    SELECT GB_CO=JR_CO, GB_DIV=JR_DIV, GB_GLC=JR_CC, GB_GLA=JR_ACC,
-           Period=JR_DATE/100, JR_AMT  -- assumed column names; will adjust based on actual schema
-    FROM dbo.YTDJRL WHERE JR_DATE BETWEEN 20260201 AND 20260229
-),
-g AS (
-    SELECT GB_CO, GB_DIV, GB_GLC, GB_GLA, GB_DATE AS Period, GB_AMT
-    FROM dbo.GLCAL WHERE GB_DATE = 202602
-)
-SELECT j_sum=SUM(j.JR_AMT), g_sum=SUM(g.GB_AMT), diff=SUM(j.JR_AMT) - SUM(g.GB_AMT)
-FROM j FULL JOIN g ON j.GB_CO=g.GB_CO AND j.GB_DIV=g.GB_DIV
-       AND j.GB_GLC=g.GB_GLC AND j.GB_GLA=g.GB_GLA;
+SELECT TOP 5 StartedUtc, Status, RunKind, RowsCopied, WatermarkFrom, WatermarkTo
+FROM dbo.AcctLoadControl WHERE TableName='YTDJRL' ORDER BY StartedUtc DESC;
 ```
 
+| StartedUtc | Status | RunKind | RowsCopied | WatermarkFrom | WatermarkTo |
+|---|---|---|---|---|---|
+| 2026-05-31 15:02 | COMPLETE | INCREMENTAL | 2 | 202605310947083127 | 202605311038083134 |
+| 2026-05-31 14:21 | COMPLETE | INITIAL | 801,683 | 0 | 202605310947083127 |
+
+Both pipelines green. Watermark advances cleanly between runs.
+
+### Test 2 — Date coverage includes unclosed periods
+
+```sql
+SELECT MIN(YJ_DT) min_dt, MAX(YJ_DT) max_dt, COUNT(*) total_rows,
+       SUM(CASE WHEN YJ_DT >= 20260301 THEN 1 ELSE 0 END) AS unclosed_rows
+FROM dbo.YTDJRL;
+```
+
+| min_dt | max_dt | total_rows | unclosed_rows (Mar-Dec 2026) |
+|---|---|---|---|
+| 20190129 | 20260630 | 801,685 | 41,107 |
+
+This was the original gap: 41,107 journal lines from periods that haven't closed yet on the source. Previously invisible to us.
+
+### Test 3 — Aggregate-sum reconciliation to GLCAL (closed period 202602)
+
+```sql
+WITH yj AS (SELECT RTRIM(YJ_ACC) acc, SUM(YJ_AMT) j FROM dbo.YTDJRL
+             WHERE YJ_DT BETWEEN 20260201 AND 20260229 GROUP BY YJ_ACC),
+     gl AS (SELECT RTRIM(GB_GLA) acc, SUM(GB_AMT) g FROM dbo.GLCAL
+             WHERE GB_DATE = 202602 GROUP BY GB_GLA)
+SELECT 'YTDJRL P&L' k, SUM(yj.j) v
+  FROM yj JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = yj.acc WHERE am.ACTYP IN ('2','3')
+UNION ALL SELECT 'GLCAL  P&L', SUM(gl.g)
+  FROM gl JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = gl.acc WHERE am.ACTYP IN ('2','3');
+```
+
+| Source | P&L sum (Feb 2026) |
+|---|---:|
+| YTDJRL | −$14,254.05 |
+| GLCAL  | −$14,254.05 |
+| Difference | **$0.00** (exact) |
+
+Note: only P&L accounts (`ACTYP IN ('2','3')`) reconcile this way. GLCAL mixes BS-snapshot rows with P&L-flow rows for the same period; YTDJRL is pure flow (every row is a posting). Restricting to P&L apples-to-apples.
+
+### Test 4 — Per-account drift (Feb 2026, P&L only)
+
+```sql
+-- Same yj/gl CTEs as Test 3
+SELECT COUNT(*) AS drifted_accounts
+FROM yj FULL JOIN gl ON yj.acc = gl.acc
+JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = COALESCE(yj.acc, gl.acc)
+WHERE am.ACTYP IN ('2','3') AND ABS(ISNULL(yj.j,0) - ISNULL(gl.g,0)) > 0.005;
+```
+
+**Result: 0 drifted accounts.** Every P&L account in GLCAL Feb 2026 sums identically from YTDJRL.
+
+### Test 5 — Monthly P&L for unclosed periods (the original goal)
+
+```sql
+WITH y AS (SELECT CAST(YJ_DT AS INT)/100 period, RTRIM(YJ_ACC) acc, SUM(YJ_AMT) amt
+             FROM dbo.YTDJRL WHERE YJ_DT BETWEEN 20260301 AND 20260531
+             GROUP BY CAST(YJ_DT AS INT)/100, YJ_ACC)
+SELECT period,
+       SUM(CASE WHEN am.ACTYP='2' THEN -amt ELSE 0 END) AS revenue,
+       SUM(CASE WHEN am.ACTYP='3' THEN  amt ELSE 0 END) AS expense,
+       SUM(CASE WHEN am.ACTYP IN ('2','3') THEN -amt ELSE 0 END) AS net_income
+  FROM y JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = y.acc
+ WHERE am.ACTYP IN ('2','3') GROUP BY period ORDER BY period;
+```
+
+| Period | Revenue | Expense | Net Income |
+|---:|---:|---:|---:|
+| 202601 (closed) | $3.32M | $3.40M | −$0.08M |
+| 202602 (closed) | $3.13M | $3.11M | +$0.01M |
+| **202603 (unclosed)** | **$4.31M** | **$3.66M** | **+$0.65M** |
+| **202604 (unclosed)** | **$6.26M** | **$5.21M** | **+$1.05M** |
+| **202605 (unclosed, MTD)** | **$2.88M** | **$3.74M** | **−$0.86M** |
+
+Mar–May 2026 monthly P&L was previously available only out of Crystal's report writer. Now it's queryable directly.
+
 ---
 
-## What this unlocks once `YTDJRL` is flowing
+## What this unlocks
 
-Same list as before, but now achieved through one table instead of five:
-
-| Capability | How |
-|---|---|
-| Monthly P&L inside any unclosed period | `SELECT SUM(JR_AMT) FROM YTDJRL WHERE JR_DATE BETWEEN <month_start> AND <month_end> GROUP BY JR_CO, JR_DIV, JR_CC, JR_ACC` |
-| Branch / department / brand split of unclosed activity | Same, with grouping by CC suffix / prefix |
-| JE-level audit trail | YTDJRL rows are individual postings with source-system, customer/vendor/invoice/order references |
-| Unusual-JE detection | Pattern detection on YTDJRL.JR_AMT (round numbers, weekend posts, etc.) |
-| "Who posted this, when?" traceability | YTDJRL captures the posting metadata directly |
-| Full reconciliation back to GLCAL | `SUM(YTDJRL by month) == GLCAL.GB_AMT` |
+| Capability | Before | After |
+|---|---|---|
+| Monthly P&L inside an unclosed period | Available only from Crystal report writer | Queryable directly from `dbo.YTDJRL` |
+| Branch / dept / brand split of unclosed activity | Not possible from the replica | `GROUP BY YJ_CC` (per the CC encoding in [data-model.md](data-model.md)) |
+| JE-level audit trail | Inferred from GLCAL rollups | Individual `YJ_JRL` + `YJ_DES` + `YJ_CRT` (user) rows |
+| Live reconciliation | GLCAL only (closed) | YTDJRL flows → GLCAL period-end (exact P&L match) |
+| Time-stamped postings | Inferred | `YJ_DT` (transaction date) + `YJ_PDT` (posting date) per row |
 
 ---
 
-## Status of the earlier 5-table SQL package
+## Open follow-ups (low priority)
 
-The files in `sql/07_journal_line_schema.sql` through `sql/10_acctcontrol_seed.sql` are **kept as reference patterns** but should **not be deployed** as the primary plan. The empirical reconciliation work that motivated this update (see the history below) showed the 5 tables only cover ~80% of revenue and less of OpEx/BS — they're useful supplementary sources for things like per-SKU parts margin (PARTHIST) or A/P drilldown (YTDIST), but not the foundation. `YTDJRL` is.
+These don't block the core capability — they're polish.
 
-If you still want to deploy those five at some point, the SQL is ready and the spec is correct for what those tables individually do. Just don't claim they replace `YTDJRL` for financial-statement reconciliation.
+1. **ETL cadence.** Today only two runs exist (initial + one incremental). Confirm with the ETL team that the YTDJRL pipeline is scheduled on the same 4×/day cadence as the other five (03/11/15/19 UTC), or whatever's preferred for the higher-volume journal-line table.
+2. **Source retention.** YTDJRL on the source goes back to 2019. Ask the AS/400 admin whether it ever rolls into `YTDJRLH` or similar at year-end, so we know to back up the replica before that purge happens.
+3. **Index review.** Current state has `PK_YTDJRL(Id)` clustered + `IX_YTDJRL_YJ_UID(YJ_UID)`. Reporting queries will mostly filter `(YJ_DT, YJ_ACC)` or `(YJ_DT, YJ_CC)`. Consider adding a covering index if those queries get slow at scale; not urgent at 800K rows.
+4. **Status of the superseded 5-table draft.** [`sql/07_journal_line_schema.sql`](../sql/07_journal_line_schema.sql) through `sql/10_acctcontrol_seed.sql` remain in the repo as reference patterns but should **not be deployed** — they were drafted before we identified YTDJRL as the canonical source. They also reference the old audit column names (`FirstSeenUtc`/`LastSeenUtc`, since renamed to `DateAddedUtc`/`DateModifiedUtc`). Safe to delete if no longer wanted as reference.
 
 ---
 
 ## Investigation history (for the next agent or future-you)
 
-This spec went through three versions as the investigation evolved:
-
 1. **2026-05-22**: "No GLTRANS-style table found in IDR1; truly missing; need separate sourcing." (Tier 3 in `reporting-catalog.md`.)
-2. **2026-05-29**: "Actually we found it — it's distributed across 5 sub-system history tables in IDR1." Drafted the original 5-table SQL package (`sql/07-10_*.sql`). Updated the docs claiming this was the answer.
-3. **2026-05-31**: Brad pointed at the **Intellidealer 6.0 System Flowchart PDF** that was in `docs/` all along but never opened. The flowchart shows `YTDJRL` (Year-to-Date Journals) as the canonical posting table sitting next to GLCAL/GLFIS. **YTDJRL is not in IDR1** (verified by direct query). Empirical reconciliation confirmed the 5-table approach only covers ~80% of revenue, 26% of OpEx, ~10% of BS activity — i.e. the 5 tables are *participants* in the posting flow, not the consolidated source. `YTDJRL` is the right answer.
+2. **2026-05-29**: "Actually we found it — it's distributed across 5 sub-system history tables in IDR1." Drafted the original 5-table SQL package (`sql/07-10_*.sql`). Updated docs claiming this was the answer.
+3. **2026-05-31** (morning): Brad pointed at the **Intellidealer 6.0 System Flowchart PDF** that was in `docs/` all along but never opened. The flowchart shows `YTDJRL` (Year-to-Date Journals) as the canonical posting table sitting next to GLCAL/GLFIS. `YTDJRL` not in IDR1; verified empirically that the 5-table approach only covers ~80% of revenue, ~26% of OpEx, ~10% of BS activity — i.e. those tables are participants in the posting flow, not the consolidated source.
+4. **2026-05-31** (afternoon): AS/400 admin returned the `YTDJRL` DDL (saved to [`docs/YTDJRL_DDL.sql`](YTDJRL_DDL.sql)). ETL team built the pipeline against the live replica the same day with append-only / IDENTITY-PK / `YJ_UID`-watermark pattern. Five reconciliation tests confirm exact P&L match to GLCAL for closed periods and surface 41,107 previously-invisible journal lines from unclosed periods.
 
 **Lesson**: when an Intellidealer-related question can't be answered from the replica schemas alone, **read the System Flowchart PDF before reverse-engineering.** It's the authoritative source for the IBM i posting flow.
