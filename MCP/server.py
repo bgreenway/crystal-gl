@@ -1152,7 +1152,7 @@ async def dfs_departmental(year: int | None = None) -> str:
             WHERE am.ACTYP IN ('2','3') AND LEN(RTRIM(c.CA_CC)) >= 3
         )
         SELECT
-          CASE dept WHEN '2' THEN 'Sales' WHEN '3' THEN 'Service' WHEN '4' THEN 'Parts'
+          CASE dept WHEN '2' THEN 'Sales' WHEN '3' THEN 'Parts' WHEN '4' THEN 'Service'
                     WHEN '5' THEN 'Rental' WHEN '1' THEN 'Admin' WHEN '0' THEN 'Corp' ELSE dept END AS dept,
           line, -SUM(amt) AS amount
         FROM base GROUP BY dept, line ORDER BY dept, line
@@ -1183,7 +1183,7 @@ async def dfs_departmental(year: int | None = None) -> str:
           AND am.ACTYP IN ('2','3') AND LEN(RTRIM(g.GB_GLC)) >= 3
     )
     SELECT
-      CASE dept WHEN '2' THEN 'Sales' WHEN '3' THEN 'Service' WHEN '4' THEN 'Parts'
+      CASE dept WHEN '2' THEN 'Sales' WHEN '3' THEN 'Parts' WHEN '4' THEN 'Service'
                 WHEN '5' THEN 'Rental' WHEN '1' THEN 'Admin' WHEN '0' THEN 'Corp' ELSE dept END AS dept,
       line,
       -SUM(GB_AMT) AS amount  -- flip sign: revenue positive, expense negative

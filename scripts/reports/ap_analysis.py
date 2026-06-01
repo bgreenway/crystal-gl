@@ -36,7 +36,7 @@ BRANCH_NAMES = {
 }
 DEPT_NAMES = {
     "0": "Balance Sheet / Corp", "1": "Admin", "2": "Sales",
-    "3": "Service", "4": "Parts", "5": "Rental",
+    "3": "Parts", "4": "Service", "5": "Rental", "6": "Used",
 }
 
 VENDOR_NAME_EXPR = """COALESCE(

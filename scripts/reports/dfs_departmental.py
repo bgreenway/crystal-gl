@@ -24,9 +24,13 @@ from _common import (
     pnl_activity_through, themed_table,
 )
 
-# Dept = CC leading digit. v2 columns:
-#   Sales = 2xx, Service = 3xx, Parts = 4xx, Rental = 5xx, Admin = 1xx, Corp = 0xx
-DEPTS = [("Sales", "2"), ("Service", "3"), ("Parts", "4"), ("Rental", "5"), ("Admin", "1")]
+# Dept = CC leading digit. CORRECTED 2026-06-01 against Intellidealer Jan 2026
+# All Entities IS (matched to the dollar). Earlier code had Parts/Service swapped.
+#   Sales=2xx, Parts=3xx, Service=4xx, Rental=5xx, Used=6xx, Admin=1xx, Corp=0xx
+# DEPTS order = display order for the report columns. Used (6xx) omitted since
+# v2 CFO layout doesn't include it; add later if Crystal asks.
+DEPTS = [("Sales", "2"), ("Service", "4"), ("Parts", "3"),
+         ("Rental", "5"), ("Admin", "1")]
 
 
 def fetch_dept_pnl(year: int | None, through: int | None = None):
