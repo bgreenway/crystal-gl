@@ -624,6 +624,48 @@ async def load_status() -> str:
 
 
 # =============================================================================
+# Reference data tools
+# =============================================================================
+
+# Crystal's 18 branches + special cost centers. Branch is the trailing 2 digits
+# of the cost center (CC). Verified 2026-05-27 against Sales and Gross Summary.xlsx.
+_BRANCH_NAMES = {
+    "01": "Deland",         "02": "Leesburg",       "03": "Parts Warehouse",
+    "04": "Chiefland",      "05": "Spring Hill",    "06": "Ocala",
+    "07": "Homosassa",      "08": "Hastings",       "09": "Palatka",
+    "10": "Starke",         "11": "Live Oak",       "12": "Madison",
+    "13": "Panama City",    "14": "Tallahassee",    "15": "Cairo",
+    "16": "Jacksonville",   "17": "Lecanto",        "18": "Dothan",
+    "91": "Other",          "93": "Wholesale",      "95": "Corporate",
+}
+
+
+@mcp.tool()
+async def branch_list() -> str:
+    """Crystal Tractor branch code ↔ name mapping.
+
+    Branch is encoded as the trailing 2 digits of the cost-center column
+    (RIGHT(GB_GLC, 2) in GLCAL, RIGHT(DN_CC, 2) in YTDIST, etc.). Use the
+    2-digit code when filtering other tools by `branch`. Translate from
+    a branch name a user mentions ("Tallahassee") to the code ("14")
+    before calling income_statement(), trial_balance(), ap_analysis(), etc.
+
+    Note: codes 91 / 93 / 95 are non-branch cost-center buckets (Other /
+    Wholesale / Corporate) — included here because they appear in the same
+    column space and you'll see them in by-branch breakdowns.
+    """
+    return json.dumps({
+        "data": [{"code": c, "name": n} for c, n in sorted(_BRANCH_NAMES.items())],
+        "meta": {
+            "count": len(_BRANCH_NAMES),
+            "real_branches": 18,
+            "verified": "2026-05-27 against docs/Sales and Gross Summary.xlsx",
+            "usage": "trailing 2 digits of cost-center column",
+        },
+    }, indent=2)
+
+
+# =============================================================================
 # Report tools — return structured summaries of the same data the
 # scripts/reports/*.py CLI generators put into PDFs. For full PDFs run the
 # CLI scripts (which are kept in sync with these tools' section maps).
