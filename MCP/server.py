@@ -624,6 +624,206 @@ async def load_status() -> str:
 
 
 # =============================================================================
+# Report tools — return structured summaries of the same data the
+# scripts/reports/*.py CLI generators put into PDFs. For full PDFs run the
+# CLI scripts (which are kept in sync with these tools' section maps).
+# =============================================================================
+
+@mcp.tool()
+async def ap_analysis(period_from: str, period_to: str) -> str:
+    """Accounts Payable summary from dbo.YTDIST for a date window.
+
+    Returns: total spend (YoY), top 25 vendors with class flag (outside/
+    internal-JE/intercompany), spend by Kubota DFS dept, spend by branch.
+
+    Args:
+        period_from: invoice-date floor YYYYMMDD (e.g. 20260101)
+        period_to:   invoice-date ceiling YYYYMMDD (e.g. 20260531)
+
+    For a full PDF including aging, largest invoices, and YTDJRL recon, run:
+        python scripts/reports/ap_analysis.py --period-from <X> --period-to <Y>
+    """
+    try:
+        pf = int(period_from); pt = int(period_to)
+    except ValueError:
+        return json.dumps({"error": True, "message": "period_from/to must be YYYYMMDD ints"})
+    pyf, pyt = pf - 10000, pt - 10000  # prior year window
+    sql = f"""
+    WITH summary AS (
+        SELECT
+          (SELECT COUNT(DISTINCT DN_TID) FROM dbo.YTDIST WHERE DN_DTI BETWEEN {pf} AND {pt}) AS invoices,
+          (SELECT COUNT(DISTINCT RTRIM(DN_VEN)) FROM dbo.YTDIST WHERE DN_DTI BETWEEN {pf} AND {pt}) AS vendors,
+          (SELECT SUM(DN_GRS) FROM dbo.YTDIST WHERE DN_DTI BETWEEN {pf} AND {pt}
+             AND DN_GRS > 0 AND DN_ACC NOT LIKE '2%') AS spend,
+          (SELECT SUM(DN_GRS) FROM dbo.YTDIST WHERE DN_DTI BETWEEN {pyf} AND {pyt}
+             AND DN_GRS > 0 AND DN_ACC NOT LIKE '2%') AS prior_spend
+    ),
+    top_v AS (
+        SELECT TOP 25
+          RTRIM(DN_VEN) AS code,
+          LEFT(RTRIM(MAX(CASE WHEN DN_NME NOT LIKE '%COMPUTER GENERATED%' THEN DN_NME END)), 35) AS name,
+          COUNT(DISTINCT DN_TID) AS invoices,
+          SUM(CASE WHEN DN_GRS>0 AND DN_ACC NOT LIKE '2%' THEN DN_GRS ELSE 0 END) AS spend
+        FROM dbo.YTDIST WHERE DN_DTI BETWEEN {pf} AND {pt}
+        GROUP BY DN_VEN HAVING SUM(CASE WHEN DN_GRS>0 AND DN_ACC NOT LIKE '2%' THEN DN_GRS ELSE 0 END) > 0
+        ORDER BY 4 DESC
+    )
+    SELECT 'summary' AS section, NULL AS code, NULL AS name, NULL AS invoices,
+           s.invoices AS num1, s.vendors AS num2, s.spend AS num3, s.prior_spend AS num4
+    FROM summary s
+    UNION ALL
+    SELECT 'top_vendor', code, name, invoices, NULL, NULL, spend, NULL FROM top_v
+    """
+    r = _exec(sql)
+    return _result_to_text(r, extra_meta={"period_from": pf, "period_to": pt})
+
+
+@mcp.tool()
+async def balance_sheet_v2(period: str, branch: str | None = None) -> str:
+    """Consolidated balance sheet section subtotals using v2 CFO layout.
+
+    Args:
+        period: 'YYYY-MM' or 'YYYYMM' (e.g. '2025-12' or 202512)
+        branch: optional 2-digit branch suffix (e.g. '14' for Tallahassee)
+
+    Returns section totals (Cash, AR, Inventory, PP&E, etc.) by joining
+    GLCAL BS-account balances to ACCMAST. Run the CLI script for the full PDF.
+    """
+    try:
+        per = _parse_period(period)
+    except ValueError as e:
+        return json.dumps({"error": True, "message": str(e)})
+    section_case = """
+    CASE
+      WHEN RTRIM(g.GB_GLA) IN ('10100','10110','10113','10114','10140','10150','10151','10160','10170') THEN 'Cash & Equivalents'
+      WHEN RTRIM(g.GB_GLA) IN ('10200','10204','10210','10224','10230','10241','10242','10245','10246') THEN 'Accounts Receivable'
+      WHEN RTRIM(g.GB_GLA) IN ('10180','10182') THEN 'Intercompany (asset)'
+      WHEN RTRIM(g.GB_GLA) IN ('12000','12007') THEN 'Inventory - Wholegoods'
+      WHEN RTRIM(g.GB_GLA) IN ('13000','13900') THEN 'Inventory - Parts'
+      WHEN RTRIM(g.GB_GLA) IN ('14000','14100','14200') THEN 'Work-in-Process'
+      WHEN RTRIM(g.GB_GLA) IN ('12100','13010') THEN 'Reserves'
+      WHEN LEFT(RTRIM(g.GB_GLA),2) IN ('15','16') THEN 'PP&E (net)'
+      WHEN LEFT(RTRIM(g.GB_GLA),2) = '17' THEN 'Intangibles & Other'
+      WHEN RTRIM(g.GB_GLA) = '20350' THEN 'Floorplan'
+      WHEN RTRIM(g.GB_GLA) IN ('20100','20200','20300','20500','20600') THEN 'AP & Taxes'
+      WHEN LEFT(RTRIM(g.GB_GLA),2) = '21' THEN 'Accrued Expenses'
+      WHEN RTRIM(g.GB_GLA) IN ('24050','24060','24070') THEN 'Related Party Loans'
+      WHEN RTRIM(g.GB_GLA) = '24900' THEN 'Intercompany Liabilities'
+      WHEN LEFT(RTRIM(g.GB_GLA),2) = '25' THEN 'Notes Payable - LT'
+      WHEN LEFT(RTRIM(g.GB_GLA),2) IN ('27','28','29') THEN 'Equity'
+      ELSE 'Other ' + CASE WHEN am.ACTYP='1' THEN 'Asset' ELSE 'Liab/Equity' END
+    END
+    """
+    where = [f"g.GB_DATE = {per}", "am.ACTYP = '1'"]
+    if branch:
+        where.append("RIGHT(RTRIM(g.GB_GLC),2) = ?")
+    sql = f"""
+    SELECT {section_case} AS Section, SUM(g.GB_AMT) AS Balance
+    FROM dbo.GLCAL g
+    JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = RTRIM(g.GB_GLA)
+    WHERE {' AND '.join(where)}
+    GROUP BY {section_case}
+    HAVING SUM(g.GB_AMT) <> 0
+    ORDER BY Balance DESC
+    """
+    r = _exec(sql, (branch.strip(),) if branch else ())
+    return _result_to_text(r, extra_meta={"period": per, "branch": branch})
+
+
+@mcp.tool()
+async def cash_flow(year: int, branch: str | None = None) -> str:
+    """Cash flow statement (indirect method) for a fiscal year.
+
+    Computes Operating (NI + D&A + WC changes), Investing (PP&E +
+    Intangibles), Financing (notes, intercompany, floorplan, equity)
+    from BS deltas between (year-1)-12 and year-12.
+    """
+    boy = (year - 1) * 100 + 12
+    eoy = year * 100 + 12
+    branch_filter = "AND RIGHT(RTRIM(g.GB_GLC),2) = ?" if branch else ""
+    params = (branch.strip(),) if branch else ()
+    sql = f"""
+    WITH ni AS (
+        SELECT -SUM(g.GB_AMT) AS net_income
+        FROM dbo.GLCAL g JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = RTRIM(g.GB_GLA)
+        WHERE am.ACTYP IN ('2','3') AND g.GB_DATE BETWEEN {year*100+1} AND {year*100+12}
+              {branch_filter}
+    ),
+    da AS (
+        SELECT -SUM(g.GB_AMT) AS da
+        FROM dbo.GLCAL g
+        WHERE RTRIM(g.GB_GLA) IN ('55100','55300','55400')
+              AND g.GB_DATE BETWEEN {year*100+1} AND {year*100+12}
+              {branch_filter}
+    ),
+    cash_balances AS (
+        SELECT
+          SUM(CASE WHEN g.GB_DATE = {boy} THEN g.GB_AMT ELSE 0 END) AS begin_cash,
+          SUM(CASE WHEN g.GB_DATE = {eoy} THEN g.GB_AMT ELSE 0 END) AS end_cash
+        FROM dbo.GLCAL g
+        WHERE RTRIM(g.GB_GLA) IN ('10100','10110','10113','10114','10140','10150','10151','10160','10170')
+              {branch_filter}
+    )
+    SELECT 'net_income' AS line, ni.net_income AS amount, NULL AS extra FROM ni
+    UNION ALL SELECT 'd_and_a', da.da, NULL FROM da
+    UNION ALL SELECT 'begin_cash', cb.begin_cash, NULL FROM cash_balances cb
+    UNION ALL SELECT 'end_cash', cb.end_cash, NULL FROM cash_balances cb
+    UNION ALL SELECT 'actual_cash_change', cb.end_cash - cb.begin_cash, NULL FROM cash_balances cb
+    """
+    r = _exec(sql, params + params + params if branch else ())
+    return _result_to_text(r, extra_meta={
+        "year": year, "branch": branch,
+        "note": "For full BS-delta breakdown by working-capital line, investing, financing, see scripts/reports/cash_flow.py",
+    })
+
+
+@mcp.tool()
+async def dfs_departmental(year: int) -> str:
+    """Kubota DFS departmental P&L for a fiscal year.
+
+    Returns per-dept (Sales/Service/Parts/Rental/Admin) and consolidated
+    revenue, COGS, gross profit, OpEx, EBITDA, D&A, Operating Income,
+    Interest, Other, Net Income. Dept from CC leading digit.
+
+    For the full 7-column PDF (with $K formatting, color bands),
+    run scripts/reports/dfs_departmental.py --year YYYY.
+    """
+    sql = f"""
+    WITH base AS (
+        SELECT LEFT(RTRIM(g.GB_GLC),1) AS dept,
+               CASE
+                 WHEN am.ACTYP='2' AND LEFT(RTRIM(am.ACACC),1)='3' AND am.ACACC NOT IN ('42210','42005','42212') THEN 'Revenue'
+                 WHEN am.ACTYP='2' AND LEFT(RTRIM(am.ACACC),1)='4' AND am.ACACC NOT IN ('42210','42005','42212') THEN 'COGS'
+                 WHEN RTRIM(am.ACACC) = '51910' THEN 'Variable'
+                 WHEN am.ACTYP='3' AND LEFT(RTRIM(am.ACACC),2) = '51' AND RTRIM(am.ACACC) <> '51910' THEN 'Personnel'
+                 WHEN am.ACTYP='3' AND LEFT(RTRIM(am.ACACC),2) IN ('52','53','54','56','57','58')
+                      AND RTRIM(am.ACACC) NOT IN ('58200','58290','58310','55100','55300','55400') THEN 'Operating'
+                 WHEN am.ACTYP='3' AND LEFT(RTRIM(am.ACACC),3) = '590' THEN 'Fixed'
+                 WHEN RTRIM(am.ACACC) IN ('55100','55300','55400') THEN 'DA'
+                 WHEN RTRIM(am.ACACC) IN ('58200','58290','59100') THEN 'Interest'
+                 WHEN am.ACTYP IN ('2','3') AND LEFT(RTRIM(am.ACACC),1) IN ('6','7') THEN 'Other'
+                 ELSE 'Unclassified'
+               END AS line,
+               g.GB_AMT
+        FROM dbo.GLCAL g
+        JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = RTRIM(g.GB_GLA)
+        WHERE g.GB_DATE BETWEEN {year*100+1} AND {year*100+12}
+          AND am.ACTYP IN ('2','3') AND LEN(RTRIM(g.GB_GLC)) >= 3
+    )
+    SELECT
+      CASE dept WHEN '2' THEN 'Sales' WHEN '3' THEN 'Service' WHEN '4' THEN 'Parts'
+                WHEN '5' THEN 'Rental' WHEN '1' THEN 'Admin' WHEN '0' THEN 'Corp' ELSE dept END AS dept,
+      line,
+      -SUM(GB_AMT) AS amount  -- flip sign: revenue positive, expense negative
+    FROM base
+    GROUP BY dept, line
+    ORDER BY dept, line
+    """
+    r = _exec(sql)
+    return _result_to_text(r, extra_meta={"year": year})
+
+
+# =============================================================================
 # Escape hatch
 # =============================================================================
 
