@@ -185,3 +185,145 @@ def make_doc(output_path: str, title: str = "Crystal Tractor"):
 
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+# ---- YTDJRL roll-forward helpers (for arbitrary-date "through" mode) -------
+def last_closed_period_on_or_before(yyyymmdd: int) -> int:
+    """Return the latest GLCAL closed period (YYYYMM) whose period-end is on or
+    before yyyymmdd. Used to anchor a roll-forward calculation.
+
+    Example: through=20260415 → returns 202603 if Mar 2026 is closed, else
+    202602 if only Feb is closed, etc. (Won't return the *current* month even
+    if you pass an early date in it — GLCAL only has rows once a period closes.)
+    """
+    period = yyyymmdd // 100  # YYYYMM
+    _, rows = fetch(
+        "SELECT MAX(GB_DATE) FROM dbo.GLCAL WHERE GB_DATE < ?", (period,)
+    )
+    return int(rows[0][0]) if rows[0][0] is not None else 0
+
+
+def bs_balance_through(through: int, branch: str | None) -> list[tuple[str, str, float]]:
+    """Balance-sheet balances at an arbitrary date via roll-forward.
+
+    For each BS account: GLCAL period-end balance at the last closed period
+    before `through`, plus the sum of YTDJRL postings strictly after that
+    period-end and on/before `through`.
+
+    Returns list of (acct, name, balance) tuples.
+    """
+    anchor = last_closed_period_on_or_before(through)  # YYYYMM
+    anchor_eom = anchor * 100 + 31                     # safe upper bound for date math
+    branch_glcal = f"AND RIGHT(RTRIM(g.GB_GLC),2) = '{branch}'" if branch else ""
+    branch_yj    = f"AND RIGHT(RTRIM(y.YJ_CC),2) = '{branch}'"   if branch else ""
+
+    cols, rows = fetch(f"""
+    WITH closed AS (
+        SELECT RTRIM(g.GB_GLA) AS acct,
+               LEFT(RTRIM(am.ACNME), 40) AS name,
+               SUM(g.GB_AMT) AS bal
+        FROM dbo.GLCAL g
+        JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = RTRIM(g.GB_GLA)
+        WHERE g.GB_DATE = {anchor} AND am.ACTYP = '1' {branch_glcal}
+        GROUP BY g.GB_GLA, am.ACNME
+    ),
+    activity AS (
+        SELECT RTRIM(y.YJ_ACC) AS acct,
+               LEFT(RTRIM(am.ACNME), 40) AS name,
+               SUM(y.YJ_AMT) AS amt
+        FROM dbo.YTDJRL y
+        JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = RTRIM(y.YJ_ACC)
+        WHERE am.ACTYP = '1' AND y.YJ_DT > {anchor_eom} AND y.YJ_DT <= {through}
+              {branch_yj}
+        GROUP BY y.YJ_ACC, am.ACNME
+    )
+    SELECT COALESCE(c.acct, a.acct) AS acct,
+           COALESCE(c.name, a.name) AS name,
+           ISNULL(c.bal, 0) + ISNULL(a.amt, 0) AS bal
+    FROM closed c FULL OUTER JOIN activity a ON a.acct = c.acct
+    WHERE ISNULL(c.bal, 0) + ISNULL(a.amt, 0) <> 0
+    """)
+    return rows
+
+
+def pnl_activity_through(through: int, branch: str | None, *, group_by_cc_digit: bool = False):
+    """P&L (revenue + expense) activity from YTDJRL between year-start and `through`.
+
+    Returns list of rows. Shape depends on group_by_cc_digit:
+      False: (acct, name, amount) — for IS-style by-account reporting
+      True:  (dept_digit, line_kind, amount) — for DFS-style departmental,
+             where line_kind is one of Revenue/COGS/Variable/Personnel/
+             Operating/Fixed/DA/Interest/Other based on account.
+    """
+    year = through // 10000
+    year_start = year * 10000 + 101
+    branch_yj = f"AND RIGHT(RTRIM(y.YJ_CC),2) = '{branch}'" if branch else ""
+
+    if not group_by_cc_digit:
+        _, rows = fetch(f"""
+        SELECT RTRIM(y.YJ_ACC) AS acct,
+               LEFT(RTRIM(am.ACNME), 40) AS name,
+               SUM(y.YJ_AMT) AS amt
+        FROM dbo.YTDJRL y
+        JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = RTRIM(y.YJ_ACC)
+        WHERE am.ACTYP IN ('2','3')
+          AND y.YJ_DT BETWEEN {year_start} AND {through}
+          {branch_yj}
+        GROUP BY y.YJ_ACC, am.ACNME
+        HAVING SUM(y.YJ_AMT) <> 0
+        """)
+        return rows
+
+    # Departmental: group by CC leading digit + categorized line
+    _, rows = fetch(f"""
+    SELECT LEFT(RTRIM(y.YJ_CC),1) AS dept,
+           CASE
+             WHEN am.ACTYP='2' AND LEFT(RTRIM(am.ACACC),1)='3' AND am.ACACC NOT IN ('42210','42005','42212') THEN 'Revenue'
+             WHEN am.ACTYP='2' AND LEFT(RTRIM(am.ACACC),1)='4' AND am.ACACC NOT IN ('42210','42005','42212') THEN 'COGS'
+             WHEN RTRIM(am.ACACC) = '51910' THEN 'Variable'
+             WHEN am.ACTYP='3' AND LEFT(RTRIM(am.ACACC),2) = '51' AND RTRIM(am.ACACC) <> '51910' THEN 'Personnel'
+             WHEN am.ACTYP='3' AND LEFT(RTRIM(am.ACACC),2) IN ('52','53','54','56','57','58')
+                  AND RTRIM(am.ACACC) NOT IN ('58200','58290','58310','55100','55300','55400') THEN 'Operating'
+             WHEN am.ACTYP='3' AND LEFT(RTRIM(am.ACACC),3) = '590' THEN 'Fixed'
+             WHEN RTRIM(am.ACACC) IN ('55100','55300','55400') THEN 'DA'
+             WHEN RTRIM(am.ACACC) IN ('58200','58290','59100') THEN 'Interest'
+             WHEN am.ACTYP IN ('2','3') AND LEFT(RTRIM(am.ACACC),1) IN ('6','7') THEN 'Other'
+             ELSE 'Unclassified'
+           END AS line,
+           SUM(y.YJ_AMT) AS amt
+    FROM dbo.YTDJRL y
+    JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = RTRIM(y.YJ_ACC)
+    WHERE am.ACTYP IN ('2','3')
+      AND y.YJ_DT BETWEEN {year_start} AND {through}
+      AND LEN(RTRIM(y.YJ_CC)) >= 3
+    GROUP BY LEFT(RTRIM(y.YJ_CC),1),
+             CASE
+               WHEN am.ACTYP='2' AND LEFT(RTRIM(am.ACACC),1)='3' AND am.ACACC NOT IN ('42210','42005','42212') THEN 'Revenue'
+               WHEN am.ACTYP='2' AND LEFT(RTRIM(am.ACACC),1)='4' AND am.ACACC NOT IN ('42210','42005','42212') THEN 'COGS'
+               WHEN RTRIM(am.ACACC) = '51910' THEN 'Variable'
+               WHEN am.ACTYP='3' AND LEFT(RTRIM(am.ACACC),2) = '51' AND RTRIM(am.ACACC) <> '51910' THEN 'Personnel'
+               WHEN am.ACTYP='3' AND LEFT(RTRIM(am.ACACC),2) IN ('52','53','54','56','57','58')
+                    AND RTRIM(am.ACACC) NOT IN ('58200','58290','58310','55100','55300','55400') THEN 'Operating'
+               WHEN am.ACTYP='3' AND LEFT(RTRIM(am.ACACC),3) = '590' THEN 'Fixed'
+               WHEN RTRIM(am.ACACC) IN ('55100','55300','55400') THEN 'DA'
+               WHEN RTRIM(am.ACACC) IN ('58200','58290','59100') THEN 'Interest'
+               WHEN am.ACTYP IN ('2','3') AND LEFT(RTRIM(am.ACACC),1) IN ('6','7') THEN 'Other'
+               ELSE 'Unclassified'
+             END
+    """)
+    return rows
+
+
+def ytd_ni_through(through: int, branch: str | None) -> float:
+    """YTD Net Income from YTDJRL postings between year-start and `through`."""
+    year = through // 10000
+    year_start = year * 10000 + 101
+    branch_yj = f"AND RIGHT(RTRIM(y.YJ_CC),2) = '{branch}'" if branch else ""
+    _, rows = fetch(f"""
+    SELECT SUM(y.YJ_AMT) FROM dbo.YTDJRL y
+    JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = RTRIM(y.YJ_ACC)
+    WHERE am.ACTYP IN ('2','3')
+      AND y.YJ_DT BETWEEN {year_start} AND {through}
+      {branch_yj}
+    """)
+    return -float(rows[0][0] or 0)

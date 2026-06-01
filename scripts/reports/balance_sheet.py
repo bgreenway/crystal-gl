@@ -23,7 +23,8 @@ from reportlab.lib import colors
 
 from _common import (
     BAND_GRAY, BRAND_BLUE, H1, H2, SMALL, SUB,
-    fetch, fmt_money, make_doc, now_str, themed_table,
+    bs_balance_through, fetch, fmt_money, make_doc, now_str,
+    themed_table, ytd_ni_through,
 )
 
 SECTIONS_BS = [
@@ -104,8 +105,15 @@ def fetch_bs_balances_live(branch: str | None):
     return rows
 
 
-def fetch_bs_balances(period: int | None, branch: str | None):
-    """Dispatch: period=None → live (CA_CUR), else historical GLCAL period-end."""
+def fetch_bs_balances(period: int | None, through: int | None, branch: str | None):
+    """Dispatch:
+      - through given (YYYYMMDD): YTDJRL roll-forward from latest closed
+        GLCAL period before `through`.
+      - period given (YYYYMM): GLCAL period-end snapshot (historical).
+      - both None: live (COACMAST.CA_CUR) snapshot.
+    """
+    if through is not None:
+        return bs_balance_through(through, branch)
     if period is None:
         return fetch_bs_balances_live(branch)
     return fetch_bs_balances_glcal(period, branch)
@@ -164,10 +172,15 @@ def categorize(rows):
     return sections
 
 
-def build_pdf(period: int | None, branch: str | None, sections: dict, ytd_ni: float, output_path: str) -> str:
+def build_pdf(period: int | None, through: int | None, branch: str | None,
+              sections: dict, ytd_ni: float, output_path: str) -> str:
     doc = make_doc(output_path, title="Crystal Tractor — Balance Sheet")
     elements: list = []
-    if period is None:
+    if through is not None:
+        s = str(through)
+        period_label = f"As of {s[:4]}-{s[4:6]}-{s[6:]} (YTDJRL roll-forward)"
+        source_label = "dbo.GLCAL last-closed + dbo.YTDJRL postings through target date"
+    elif period is None:
         period_label = "Live current state (COACMAST.CA_CUR)"
         source_label = "dbo.COACMAST.CA_CUR (live balance, includes open periods)"
     else:
@@ -248,7 +261,12 @@ def build_pdf(period: int | None, branch: str | None, sections: dict, ytd_ni: fl
     # Pre-close residual = A + L + E in GLCAL sign convention. Add NI (positive)
     # which translates to crediting equity (so equity_total -= ytd_ni in raw sign).
     from datetime import date as _date
-    year = (period // 100) if period is not None else _date.today().year
+    if through is not None:
+        year = through // 10000
+    elif period is not None:
+        year = period // 100
+    else:
+        year = _date.today().year
     pre_close_residual = asset_total + liab_total + equity_total
     if abs(pre_close_residual) > 1000:
         ni_label = f"Net Income {year} YTD (not yet closed to Retained Earnings)"
@@ -298,30 +316,44 @@ def build_pdf(period: int | None, branch: str | None, sections: dict, ytd_ni: fl
 def main():
     ap = argparse.ArgumentParser(description="Crystal Tractor Balance Sheet")
     ap.add_argument("--period", type=int, default=None,
-                    help="Period YYYYMM for historical period-end (default: live via COACMAST.CA_CUR)")
+                    help="Period YYYYMM for historical period-end via GLCAL")
+    ap.add_argument("--through", type=int, default=None,
+                    help="Arbitrary date YYYYMMDD: GLCAL last-closed + YTDJRL roll-forward")
     ap.add_argument("--branch", type=str, default=None,
                     help="2-digit branch suffix (e.g. 14); default consolidated")
     ap.add_argument("--output", type=str, default=None)
     args = ap.parse_args()
 
-    rows = fetch_bs_balances(args.period, args.branch)
+    if args.period and args.through:
+        ap.error("--period and --through are mutually exclusive")
+
+    rows = fetch_bs_balances(args.period, args.through, args.branch)
     sections = categorize(rows)
-    # For live mode, roll in YTD NI from YTDJRL (current year). For historical
-    # period mode, roll in YTD NI from GLCAL for that period's year.
-    if args.period is None:
+    # YTD NI roll-in:
+    #   through  → YTDJRL through that date (most precise)
+    #   live     → YTDJRL through today
+    #   period   → GLCAL closed-period total for that year
+    if args.through is not None:
+        ytd_ni = ytd_ni_through(args.through, args.branch)
+    elif args.period is None:
         year = date.today().year
         ytd_ni = fetch_ytd_ni(year, args.branch, live=True)
     else:
         year = args.period // 100
         ytd_ni = fetch_ytd_ni(year, args.branch, live=False)
     if args.output is None:
-        tag = (str(args.period) if args.period is not None else f"live-{date.today().isoformat()}")
+        if args.through is not None:
+            tag = f"through-{args.through}"
+        elif args.period is not None:
+            tag = str(args.period)
+        else:
+            tag = f"live-{date.today().isoformat()}"
         if args.branch:
             tag += f"-br{args.branch}"
         out = Path.home() / "Downloads" / f"Crystal-BS-{tag}.pdf"
     else:
         out = Path(args.output)
-    path = build_pdf(args.period, args.branch, sections, ytd_ni, str(out))
+    path = build_pdf(args.period, args.through, args.branch, sections, ytd_ni, str(out))
     print(f"Wrote: {path}")
 
 

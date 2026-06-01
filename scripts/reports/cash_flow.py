@@ -23,7 +23,8 @@ from reportlab.platypus import Paragraph, Spacer, TableStyle
 
 from _common import (
     BAND_GRAY, BRAND_BLUE, H1, H2, SMALL, SUB,
-    fetch, fmt_money, make_doc, now_str, themed_table,
+    bs_balance_through, fetch, fmt_money, make_doc, now_str,
+    pnl_activity_through, themed_table, ytd_ni_through,
 )
 
 # BS account groups for working-capital change calculations
@@ -61,12 +62,33 @@ DA_ACCTS = ["55100", "55300", "55400"]
 CASH_ACCTS = ["10100", "10110", "10113", "10114", "10140", "10150", "10151", "10160", "10170"]
 
 
-def balance(period: int | None, accts: list[str], branch: str | None) -> float:
+def balance(period: int | None, accts: list[str], branch: str | None, *,
+            through: int | None = None) -> float:
     """Sum balance for given accounts at a date.
 
-    period=None  → live snapshot via COACMAST.CA_CUR
-    period given → GLCAL period-end running balance
+    through given (YYYYMMDD) → GLCAL last-closed + YTDJRL roll-forward.
+    period given (YYYYMM) → GLCAL period-end snapshot.
+    both None → live snapshot via COACMAST.CA_CUR.
     """
+    if through is not None:
+        from _common import last_closed_period_on_or_before
+        anchor = last_closed_period_on_or_before(through)
+        anchor_eom = anchor * 100 + 31
+        branch_glcal = f"AND RIGHT(RTRIM(g.GB_GLC),2) = '{branch}'" if branch else ""
+        branch_yj = f"AND RIGHT(RTRIM(y.YJ_CC),2) = '{branch}'" if branch else ""
+        in_clause = ",".join("?" for _ in accts)
+        _, rows = fetch(f"""
+        SELECT
+          ISNULL((SELECT SUM(g.GB_AMT) FROM dbo.GLCAL g
+                  WHERE g.GB_DATE = {anchor} AND RTRIM(g.GB_GLA) IN ({in_clause})
+                        {branch_glcal}), 0)
+        + ISNULL((SELECT SUM(y.YJ_AMT) FROM dbo.YTDJRL y
+                  WHERE y.YJ_DT > {anchor_eom} AND y.YJ_DT <= {through}
+                        AND RTRIM(y.YJ_ACC) IN ({in_clause})
+                        {branch_yj}), 0) AS bal
+        """, tuple(accts) + tuple(accts))
+        return float(rows[0][0] or 0)
+
     if period is None:
         where = [f"RTRIM(c.CA_ACC) IN ({','.join('?' for _ in accts)})"]
         if branch:
@@ -131,20 +153,29 @@ def ytd_ni(year: int, branch: str | None, *, live: bool = False) -> float:
     return -float(rows[0][0] or 0)
 
 
-def build_pdf(year: int | None, branch: str | None, output_path: str) -> str:
+def build_pdf(year: int | None, through: int | None, branch: str | None, output_path: str) -> str:
     from datetime import date as _d
-    is_live = year is None or year == _d.today().year
-    eff_year = _d.today().year if is_live else year
-    eoy_period = None if is_live else eff_year * 100 + 12   # None → live CA_CUR
-    boy_period = (eff_year - 1) * 100 + 12                  # always GLCAL prior year-end
+    if through is not None:
+        eff_year = through // 10000
+        eoy_period = None
+        boy_period = (eff_year - 1) * 100 + 12
+        is_live = False
+        s = str(through)
+        period_label = f"YTD {eff_year} through {s[:4]}-{s[4:6]}-{s[6:]} (YTDJRL roll-forward)"
+        source_label = f"BOY: dbo.GLCAL {eff_year-1}-12 · EOY: dbo.GLCAL last-closed + dbo.YTDJRL through {through}"
+    else:
+        is_live = year is None or year == _d.today().year
+        eff_year = _d.today().year if is_live else year
+        eoy_period = None if is_live else eff_year * 100 + 12
+        boy_period = (eff_year - 1) * 100 + 12
+        period_label = (f"YTD {eff_year} (live, BOY {eff_year-1}-12 from GLCAL → EOY live from CA_CUR)"
+                        if is_live else f"Fiscal Year {eff_year}")
+        source_label = ("BOY: dbo.GLCAL · EOY: dbo.COACMAST.CA_CUR (live)"
+                        if is_live else "dbo.GLCAL (closed periods)")
 
     doc = make_doc(output_path, title="Crystal Tractor — Cash Flow")
     elements: list = []
     branch_label = f" · Branch {branch}" if branch else " · Consolidated"
-    period_label = (f"YTD {eff_year} (live, BOY {eff_year-1}-12 from GLCAL → EOY live from CA_CUR)"
-                    if is_live else f"Fiscal Year {eff_year}")
-    source_label = ("BOY: dbo.GLCAL · EOY: dbo.COACMAST.CA_CUR (live)"
-                    if is_live else "dbo.GLCAL (closed periods)")
     elements += [
         Paragraph("Crystal Tractor — Consolidated Statement of Cash Flows", H1),
         Paragraph(f"{period_label} · Indirect Method{branch_label}", SUB),
@@ -152,8 +183,22 @@ def build_pdf(year: int | None, branch: str | None, output_path: str) -> str:
         Spacer(1, 0.15 * inch),
     ]
 
-    ni = ytd_ni(eff_year, branch, live=is_live)
-    da = -yearly_activity(eff_year, DA_ACCTS, branch, live=is_live)  # expense → positive cash add-back
+    # NI + D&A: through → YTDJRL year-start to through date; else live/yearly logic
+    if through is not None:
+        ni = ytd_ni_through(through, branch)
+        # D&A via YTDJRL
+        da = -balance(None, DA_ACCTS, branch, through=through) + balance(boy_period, DA_ACCTS, branch)
+        # Actually for D&A as expense activity, easier: sum YTDJRL DA postings year-to-through
+        _, rows = fetch(f"""
+        SELECT ISNULL(SUM(y.YJ_AMT), 0) FROM dbo.YTDJRL y
+        WHERE RTRIM(y.YJ_ACC) IN ({','.join('?' for _ in DA_ACCTS)})
+          AND y.YJ_DT BETWEEN {eff_year*10000+101} AND {through}
+          {f"AND RIGHT(RTRIM(y.YJ_CC),2) = '{branch}'" if branch else ''}
+        """, tuple(DA_ACCTS))
+        da = -float(rows[0][0] or 0)  # expense in YTDJRL is positive → add-back negate
+    else:
+        ni = ytd_ni(eff_year, branch, live=is_live)
+        da = -yearly_activity(eff_year, DA_ACCTS, branch, live=is_live)
 
     # OPERATING
     elements.append(Paragraph("CASH FROM OPERATING ACTIVITIES", H2))
@@ -166,7 +211,7 @@ def build_pdf(year: int | None, branch: str | None, output_path: str) -> str:
     op_total = ni + da
     for label, accts in WC_GROUPS:
         boy = balance(boy_period, accts, branch)
-        eoy = balance(eoy_period, accts, branch)
+        eoy = balance(eoy_period, accts, branch, through=through)
         # For assets (positive balances): increase = cash use (negative)
         # For liabs (negative balances): increase in abs = cash source (positive)
         # Use signed delta with sign convention: delta of GLCAL balance
@@ -194,7 +239,7 @@ def build_pdf(year: int | None, branch: str | None, output_path: str) -> str:
     inv_rows = []
     inv_total = 0.0
     for label, accts in INVESTING_GROUPS:
-        delta = balance(eoy_period, accts, branch) - balance(boy_period, accts, branch)
+        delta = balance(eoy_period, accts, branch, through=through) - balance(boy_period, accts, branch)
         cash_impact = -delta
         inv_rows.append([f"  {label}", fmt_money(cash_impact)])
         inv_total += cash_impact
@@ -214,7 +259,7 @@ def build_pdf(year: int | None, branch: str | None, output_path: str) -> str:
     fin_rows = []
     fin_total = 0.0
     for label, accts in FINANCING_GROUPS:
-        delta = balance(eoy_period, accts, branch) - balance(boy_period, accts, branch)
+        delta = balance(eoy_period, accts, branch, through=through) - balance(boy_period, accts, branch)
         cash_impact = -delta
         fin_rows.append([f"  {label} (net of all activity)", fmt_money(cash_impact)])
         fin_total += cash_impact
@@ -232,11 +277,17 @@ def build_pdf(year: int | None, branch: str | None, output_path: str) -> str:
     elements.append(Spacer(1, 0.15*inch))
     net_per_cf = op_total + inv_total + fin_total
     begin_cash = balance(boy_period, CASH_ACCTS, branch)
-    end_cash = balance(eoy_period, CASH_ACCTS, branch)
+    end_cash = balance(eoy_period, CASH_ACCTS, branch, through=through)
     actual_change = end_cash - begin_cash
     residual = actual_change - net_per_cf
 
-    end_label = f"{eff_year}-12" if not is_live else "today (live CA_CUR)"
+    if through is not None:
+        s = str(through)
+        end_label = f"{s[:4]}-{s[4:6]}-{s[6:]} (YTDJRL roll-forward)"
+    elif is_live:
+        end_label = "today (live CA_CUR)"
+    else:
+        end_label = f"{eff_year}-12"
     rec_rows = [
         ["NET CHANGE IN CASH (per cash flow)", fmt_money(net_per_cf)],
         [f"  Beginning Cash ({eff_year-1}-12)", fmt_money(begin_cash)],
@@ -269,17 +320,26 @@ def main():
     ap = argparse.ArgumentParser(description="Crystal Tractor Cash Flow Statement")
     ap.add_argument("--year", type=int, default=None,
                     help="Fiscal year (default: current year, EOY served live via COACMAST.CA_CUR)")
+    ap.add_argument("--through", type=int, default=None,
+                    help="YTD through YYYYMMDD via YTDJRL roll-forward")
     ap.add_argument("--branch", type=str, default=None)
     ap.add_argument("--output", type=str, default=None)
     args = ap.parse_args()
+    if args.year and args.through:
+        ap.error("--year and --through are mutually exclusive")
     if args.output is None:
-        tag = str(args.year) if args.year else f"YTD-{date.today().isoformat()}"
+        if args.through:
+            tag = f"through-{args.through}"
+        elif args.year:
+            tag = str(args.year)
+        else:
+            tag = f"YTD-{date.today().isoformat()}"
         if args.branch:
             tag += f"-br{args.branch}"
         out = Path.home() / "Downloads" / f"Crystal-Cash-Flow-{tag}.pdf"
     else:
         out = Path(args.output)
-    path = build_pdf(args.year, args.branch, str(out))
+    path = build_pdf(args.year, args.through, args.branch, str(out))
     print(f"Wrote: {path}")
 
 

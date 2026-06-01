@@ -20,7 +20,8 @@ from reportlab.lib.units import inch
 from reportlab.platypus import Paragraph, Spacer, TableStyle
 
 from _common import (
-    BAND_GRAY, BRAND_BLUE, H1, SMALL, SUB, fetch, fmt_money, make_doc, now_str, themed_table,
+    BAND_GRAY, BRAND_BLUE, H1, SMALL, SUB, fetch, fmt_money, make_doc, now_str,
+    pnl_activity_through, themed_table,
 )
 
 # Dept = CC leading digit. v2 columns:
@@ -28,13 +29,31 @@ from _common import (
 DEPTS = [("Sales", "2"), ("Service", "3"), ("Parts", "4"), ("Rental", "5"), ("Admin", "1")]
 
 
-def fetch_dept_pnl(year: int | None):
+def fetch_dept_pnl(year: int | None, through: int | None = None):
     """Return dict[dept_digit][line_name] = amount (in $).
 
-    year=None or current year → live via COACMAST.CA_CUR (includes open periods).
+    through  → YTD year-to-`through-date` via YTDJRL roll-forward.
+    year=None or current → live via COACMAST.CA_CUR (includes open periods).
     year given (historical) → GLCAL full-year aggregate.
     """
     from datetime import date as _d
+    if through is not None:
+        data: dict[str, dict[str, float]] = {d: {} for _, d in DEPTS}
+        data["consolidated"] = {}
+        rows = pnl_activity_through(through, None, group_by_cc_digit=True)
+        # rows: (dept_digit, line, amt) — line uses 'Revenue'/'COGS'/'Variable'/...
+        # Remap line keys to match DFS labels and flip signs.
+        line_map = {"Revenue": "Revenue", "COGS": "COGS", "Variable": "Variable Exp",
+                    "Personnel": "Personnel Exp", "Operating": "Operating Exp",
+                    "Fixed": "Fixed Exp", "DA": "D&A",
+                    "Interest": "Interest Exp", "Other": "Other Inc/Exp"}
+        for dept, line, amt in rows:
+            mapped = line_map.get(line, line)
+            v = -float(amt or 0)
+            data.setdefault(dept, {})[mapped] = data.get(dept, {}).get(mapped, 0) + v
+            data["consolidated"][mapped] = data["consolidated"].get(mapped, 0) + v
+        return data
+
     use_live = year is None or year == _d.today().year
 
     SECTIONS = {
@@ -81,14 +100,19 @@ def fetch_dept_pnl(year: int | None):
     return data
 
 
-def build_pdf(year: int | None, data: dict, output_path: str) -> str:
+def build_pdf(year: int | None, through: int | None, data: dict, output_path: str) -> str:
     doc = make_doc(output_path, title="Crystal Tractor — Kubota DFS Departmental")
     elements: list = []
     from datetime import date as _d
-    is_live = year is None or year == _d.today().year
-    period_label = (f"YTD {_d.today().year} (live, through latest source update)"
-                    if is_live else f"Fiscal Year {year}")
-    source_label = "dbo.COACMAST.CA_CUR (live)" if is_live else "dbo.GLCAL"
+    if through is not None:
+        s = str(through)
+        period_label = f"YTD {s[:4]} through {s[:4]}-{s[4:6]}-{s[6:]} (YTDJRL roll-forward)"
+        source_label = "dbo.YTDJRL"
+    else:
+        is_live = year is None or year == _d.today().year
+        period_label = (f"YTD {_d.today().year} (live, through latest source update)"
+                        if is_live else f"Fiscal Year {year}")
+        source_label = "dbo.COACMAST.CA_CUR (live)" if is_live else "dbo.GLCAL"
     elements += [
         Paragraph("Crystal Tractor — Kubota DFS Departmental P&L", H1),
         Paragraph(f"{period_label} · Amounts in $K · Dept from CC leading digit", SUB),
@@ -221,15 +245,24 @@ def main():
     ap = argparse.ArgumentParser(description="Crystal Tractor Kubota DFS Departmental P&L")
     ap.add_argument("--year", type=int, default=None,
                     help="Fiscal year (default: current year, live via COACMAST.CA_CUR)")
+    ap.add_argument("--through", type=int, default=None,
+                    help="YTD through YYYYMMDD via YTDJRL roll-forward")
     ap.add_argument("--output", type=str, default=None)
     args = ap.parse_args()
+    if args.year and args.through:
+        ap.error("--year and --through are mutually exclusive")
     if args.output is None:
-        tag = str(args.year) if args.year else f"YTD-{date.today().isoformat()}"
+        if args.through:
+            tag = f"through-{args.through}"
+        elif args.year:
+            tag = str(args.year)
+        else:
+            tag = f"YTD-{date.today().isoformat()}"
         out = Path.home() / "Downloads" / f"Crystal-IS-Kubota-DFS-{tag}.pdf"
     else:
         out = Path(args.output)
-    data = fetch_dept_pnl(args.year)
-    path = build_pdf(args.year, data, str(out))
+    data = fetch_dept_pnl(args.year, args.through)
+    path = build_pdf(args.year, args.through, data, str(out))
     print(f"Wrote: {path}")
 
 

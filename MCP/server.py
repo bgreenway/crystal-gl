@@ -721,18 +721,88 @@ async def ap_analysis(period_from: str, period_to: str) -> str:
 
 
 @mcp.tool()
-async def balance_sheet_v2(period: str | None = None, branch: str | None = None) -> str:
+async def balance_sheet_v2(period: str | None = None, through: int | None = None,
+                            branch: str | None = None) -> str:
     """Consolidated balance sheet section subtotals using v2 CFO layout.
 
     Args:
         period: 'YYYY-MM' or 'YYYYMM' for historical period-end via GLCAL.
-                If omitted, returns LIVE current-state balances via COACMAST.CA_CUR
-                (includes activity in periods that haven't closed on the source).
+        through: YYYYMMDD for an arbitrary as-of date — uses GLCAL last-closed
+                 period before that date + YTDJRL postings rolled forward to it.
         branch: optional 2-digit branch suffix (e.g. '14' for Tallahassee)
+
+    If neither period nor through is given, returns LIVE current-state balances
+    via COACMAST.CA_CUR (includes activity in periods that haven't closed yet).
 
     Returns section totals (Cash, AR, Inventory, PP&E, etc.). Run the CLI
     script (scripts/reports/balance_sheet.py) for the full PDF.
     """
+    if through is not None:
+        # YTDJRL roll-forward: anchor = latest GLCAL closed period < through, plus
+        # YTDJRL postings between that period-end and `through`.
+        anchor_sql = "SELECT MAX(GB_DATE) FROM dbo.GLCAL WHERE GB_DATE < ?"
+        r0 = _exec(anchor_sql, (int(through) // 100,))
+        if r0.get("error") or not r0["rows"] or r0["rows"][0][0] is None:
+            return json.dumps({"error": True, "message": "no closed GLCAL period before that date"})
+        anchor = int(r0["rows"][0][0])
+        anchor_eom = anchor * 100 + 31
+        branch_g = f"AND RIGHT(RTRIM(g.GB_GLC),2) = '{branch}'" if branch else ""
+        branch_y = f"AND RIGHT(RTRIM(y.YJ_CC),2) = '{branch}'" if branch else ""
+        section_case = """
+        CASE
+          WHEN RTRIM(acct) IN ('10100','10110','10113','10114','10140','10150','10151','10160','10170') THEN 'Cash & Equivalents'
+          WHEN RTRIM(acct) IN ('10200','10204','10210','10224','10230','10241','10242','10245','10246') THEN 'Accounts Receivable'
+          WHEN RTRIM(acct) IN ('10180','10182') THEN 'Intercompany (asset)'
+          WHEN RTRIM(acct) IN ('12000','12007') THEN 'Inventory - Wholegoods'
+          WHEN RTRIM(acct) IN ('13000','13900') THEN 'Inventory - Parts'
+          WHEN RTRIM(acct) IN ('14000','14100','14200') THEN 'Work-in-Process'
+          WHEN RTRIM(acct) IN ('12100','13010') THEN 'Reserves'
+          WHEN LEFT(RTRIM(acct),2) IN ('15','16') THEN 'PP&E (net)'
+          WHEN LEFT(RTRIM(acct),2) = '17' THEN 'Intangibles & Other'
+          WHEN RTRIM(acct) = '20350' THEN 'Floorplan'
+          WHEN RTRIM(acct) IN ('20100','20200','20300','20500','20600') THEN 'AP & Taxes'
+          WHEN LEFT(RTRIM(acct),2) = '21' THEN 'Accrued Expenses'
+          WHEN RTRIM(acct) IN ('24050','24060','24070') THEN 'Related Party Loans'
+          WHEN RTRIM(acct) = '24900' THEN 'Intercompany Liabilities'
+          WHEN LEFT(RTRIM(acct),2) = '25' THEN 'Notes Payable - LT'
+          WHEN LEFT(RTRIM(acct),2) IN ('27','28','29') THEN 'Equity'
+          ELSE 'Other'
+        END
+        """
+        sql = f"""
+        WITH closed AS (
+          SELECT RTRIM(g.GB_GLA) AS acct, SUM(g.GB_AMT) AS bal
+          FROM dbo.GLCAL g JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = RTRIM(g.GB_GLA)
+          WHERE g.GB_DATE = {anchor} AND am.ACTYP = '1' {branch_g}
+          GROUP BY g.GB_GLA
+        ),
+        activity AS (
+          SELECT RTRIM(y.YJ_ACC) AS acct, SUM(y.YJ_AMT) AS amt
+          FROM dbo.YTDJRL y JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = RTRIM(y.YJ_ACC)
+          WHERE am.ACTYP = '1' AND y.YJ_DT > {anchor_eom} AND y.YJ_DT <= {int(through)}
+                {branch_y}
+          GROUP BY y.YJ_ACC
+        ),
+        merged AS (
+          SELECT COALESCE(c.acct, a.acct) AS acct,
+                 ISNULL(c.bal, 0) + ISNULL(a.amt, 0) AS bal
+          FROM closed c FULL OUTER JOIN activity a ON a.acct = c.acct
+        )
+        SELECT {section_case} AS Section, SUM(bal) AS Balance
+        FROM merged
+        WHERE bal <> 0
+        GROUP BY {section_case}
+        ORDER BY Balance DESC
+        """
+        r = _exec(sql)
+        return _result_to_text(r, extra_meta={
+            "mode": "through",
+            "through": int(through),
+            "anchor_period": anchor,
+            "source": f"GLCAL period {anchor} + YTDJRL rolled forward through {through}",
+            "branch": branch,
+        })
+
     if period is None:
         # Live mode via CA_CUR
         section_case_live = """
@@ -813,35 +883,90 @@ async def balance_sheet_v2(period: str | None = None, branch: str | None = None)
 
 
 @mcp.tool()
-async def cash_flow(year: int | None = None, branch: str | None = None) -> str:
+async def cash_flow(year: int | None = None, through: int | None = None,
+                    branch: str | None = None) -> str:
     """Cash flow statement (indirect method) for a fiscal year.
 
-    If year is omitted, returns current YTD with EOY served live from
-    COACMAST.CA_CUR (BOY still from GLCAL prior year-end). For historical
-    years, uses GLCAL closed-period balances for both endpoints.
+    Args:
+      year: fiscal year (omit for current; uses CA_CUR for live EOY)
+      through: YYYYMMDD for arbitrary as-of date (uses YTDJRL roll-forward
+               for EOY; BOY still from GLCAL prior year-end)
+      branch: optional 2-digit branch suffix
 
     Run scripts/reports/cash_flow.py for the full PDF including per-line
     working-capital, investing, and financing breakdowns.
     """
     from datetime import date as _date
-    if year is None:
+    if through is not None:
+        year = int(through) // 10000  # year derived from through date
+    elif year is None:
         year = _date.today().year
     boy = (year - 1) * 100 + 12
     eoy = year * 100 + 12
     branch_filter = "AND RIGHT(RTRIM(g.GB_GLC),2) = ?" if branch else ""
+    branch_filter_y = "AND RIGHT(RTRIM(y.YJ_CC),2) = ?" if branch else ""
     params = (branch.strip(),) if branch else ()
+    cash_accts = "'10100','10110','10113','10114','10140','10150','10151','10160','10170'"
+    da_accts = "'55100','55300','55400'"
+    year_start = year * 10000 + 101
+
+    if through is not None:
+        # Through-mode: NI + D&A from YTDJRL year-start..through; end_cash via roll-forward
+        through_int = int(through)
+        anchor_r = _exec("SELECT MAX(GB_DATE) FROM dbo.GLCAL WHERE GB_DATE < ?", (through_int // 100,))
+        if anchor_r.get("error") or not anchor_r["rows"] or anchor_r["rows"][0][0] is None:
+            return json.dumps({"error": True, "message": "no closed GLCAL period before through date"})
+        anchor = int(anchor_r["rows"][0][0]); anchor_eom = anchor * 100 + 31
+        sql = f"""
+        WITH ni AS (
+          SELECT -SUM(y.YJ_AMT) AS net_income
+          FROM dbo.YTDJRL y JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = RTRIM(y.YJ_ACC)
+          WHERE am.ACTYP IN ('2','3') AND y.YJ_DT BETWEEN {year_start} AND {through_int}
+                {branch_filter_y}
+        ),
+        da AS (
+          SELECT -SUM(y.YJ_AMT) AS da FROM dbo.YTDJRL y
+          WHERE RTRIM(y.YJ_ACC) IN ({da_accts})
+                AND y.YJ_DT BETWEEN {year_start} AND {through_int} {branch_filter_y}
+        ),
+        begin_c AS (
+          SELECT SUM(g.GB_AMT) AS begin_cash FROM dbo.GLCAL g
+          WHERE g.GB_DATE = {boy} AND RTRIM(g.GB_GLA) IN ({cash_accts}) {branch_filter}
+        ),
+        end_c AS (
+          SELECT
+            (SELECT ISNULL(SUM(g.GB_AMT),0) FROM dbo.GLCAL g
+             WHERE g.GB_DATE = {anchor} AND RTRIM(g.GB_GLA) IN ({cash_accts}) {branch_filter})
+          + (SELECT ISNULL(SUM(y.YJ_AMT),0) FROM dbo.YTDJRL y
+             WHERE y.YJ_DT > {anchor_eom} AND y.YJ_DT <= {through_int}
+                   AND RTRIM(y.YJ_ACC) IN ({cash_accts}) {branch_filter_y}) AS end_cash
+        )
+        SELECT 'net_income' AS line, ni.net_income AS amount, NULL AS extra FROM ni
+        UNION ALL SELECT 'd_and_a', da.da, NULL FROM da
+        UNION ALL SELECT 'begin_cash', bc.begin_cash, NULL FROM begin_c bc
+        UNION ALL SELECT 'end_cash', ec.end_cash, NULL FROM end_c ec
+        UNION ALL SELECT 'actual_cash_change', ec.end_cash - bc.begin_cash, NULL FROM begin_c bc, end_c ec
+        """
+        # Param order: ni branch, da branch, begin_c branch, end_c (glcal branch, ytdjrl branch)
+        run_params = (params * 5) if branch else ()
+        r = _exec(sql, run_params)
+        return _result_to_text(r, extra_meta={
+            "year": year, "through": through_int, "anchor_period": anchor, "branch": branch,
+            "note": "Through-mode: NI + D&A + end_cash sourced from YTDJRL roll-forward",
+        })
+
     sql = f"""
     WITH ni AS (
         SELECT -SUM(g.GB_AMT) AS net_income
         FROM dbo.GLCAL g JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = RTRIM(g.GB_GLA)
-        WHERE am.ACTYP IN ('2','3') AND g.GB_DATE BETWEEN {year*100+1} AND {year*100+12}
+        WHERE am.ACTYP IN ('2','3') AND g.GB_DATE BETWEEN {year_start//100} AND {year*100+12}
               {branch_filter}
     ),
     da AS (
         SELECT -SUM(g.GB_AMT) AS da
         FROM dbo.GLCAL g
-        WHERE RTRIM(g.GB_GLA) IN ('55100','55300','55400')
-              AND g.GB_DATE BETWEEN {year*100+1} AND {year*100+12}
+        WHERE RTRIM(g.GB_GLA) IN ({da_accts})
+              AND g.GB_DATE BETWEEN {year_start//100} AND {year*100+12}
               {branch_filter}
     ),
     cash_balances AS (
@@ -849,7 +974,7 @@ async def cash_flow(year: int | None = None, branch: str | None = None) -> str:
           SUM(CASE WHEN g.GB_DATE = {boy} THEN g.GB_AMT ELSE 0 END) AS begin_cash,
           SUM(CASE WHEN g.GB_DATE = {eoy} THEN g.GB_AMT ELSE 0 END) AS end_cash
         FROM dbo.GLCAL g
-        WHERE RTRIM(g.GB_GLA) IN ('10100','10110','10113','10114','10140','10150','10151','10160','10170')
+        WHERE RTRIM(g.GB_GLA) IN ({cash_accts})
               {branch_filter}
     )
     SELECT 'net_income' AS line, ni.net_income AS amount, NULL AS extra FROM ni
@@ -858,7 +983,7 @@ async def cash_flow(year: int | None = None, branch: str | None = None) -> str:
     UNION ALL SELECT 'end_cash', cb.end_cash, NULL FROM cash_balances cb
     UNION ALL SELECT 'actual_cash_change', cb.end_cash - cb.begin_cash, NULL FROM cash_balances cb
     """
-    r = _exec(sql, params + params + params if branch else ())
+    r = _exec(sql, params * 3 if branch else ())
     return _result_to_text(r, extra_meta={
         "year": year, "branch": branch,
         "note": "For full BS-delta breakdown by working-capital line, investing, financing, see scripts/reports/cash_flow.py",

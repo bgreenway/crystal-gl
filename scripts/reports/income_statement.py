@@ -24,7 +24,7 @@ from reportlab.platypus import Paragraph, Spacer, TableStyle
 
 from _common import (
     BAND_GRAY, BODY, BRAND_BLUE, H1, H2, LINE_GRAY, SMALL, SUB,
-    fetch, fmt_money, make_doc, now_str, themed_table,
+    fetch, fmt_money, make_doc, now_str, pnl_activity_through, themed_table,
 )
 
 # CFO-approved v2 section structure. Each section: list of (account, name).
@@ -71,16 +71,18 @@ for sec_name, _kind, accts in SECTIONS_IS:
         ACCT_TO_SECTION[a] = sec_name
 
 
-def fetch_pnl_amounts(year: int | None, period: int | None, branch: str | None):
-    """Sum GLCAL.GB_AMT for P&L accounts; group by (account, name).
+def fetch_pnl_amounts(year: int | None, period: int | None, through: int | None, branch: str | None):
+    """Sum P&L activity; group by (account, name).
 
     Source dispatch:
+      - through given (YYYYMMDD): YTDJRL year-start through that date
       - period given (YYYYMM): GLCAL single-month
       - year given (and != current): GLCAL annual
-      - year=None or current year (default): COACMAST.CA_CUR — live YTD,
-        includes activity in open periods that haven't closed on the source
+      - else (default): COACMAST.CA_CUR — live YTD current year
     """
     from datetime import date as _d
+    if through is not None:
+        return pnl_activity_through(through, branch, group_by_cc_digit=False)
     use_live = (period is None and (year is None or year == _d.today().year))
 
     if use_live:
@@ -153,19 +155,26 @@ def categorize(rows):
     return sections
 
 
-def build_pdf(year: int | None, period: int | None, branch: str | None, sections: dict, output_path: str) -> str:
+def build_pdf(year: int | None, period: int | None, through: int | None,
+              branch: str | None, sections: dict, output_path: str) -> str:
     doc = make_doc(output_path, title="Crystal Tractor — Income Statement")
     elements: list = []
     from datetime import date as _d
-    is_live = period is None and (year is None or year == _d.today().year)
-    if period is not None:
+    is_live = through is None and period is None and (year is None or year == _d.today().year)
+    if through is not None:
+        s = str(through)
+        label = f"YTD {s[:4]} through {s[:4]}-{s[4:6]}-{s[6:]} (YTDJRL)"
+        source_label = "dbo.YTDJRL (per-day journal-line postings)"
+    elif period is not None:
         label = f"Period {str(period)[:4]}-{str(period)[4:]}"
+        source_label = "dbo.GLCAL"
     elif is_live:
         label = f"YTD {_d.today().year} (live, through latest source update)"
+        source_label = "dbo.COACMAST.CA_CUR (live)"
     else:
         label = f"Fiscal Year {year}"
+        source_label = "dbo.GLCAL"
     branch_label = f" · Branch {branch}" if branch else " · Consolidated"
-    source_label = "dbo.COACMAST.CA_CUR (live)" if is_live else "dbo.GLCAL"
     elements += [
         Paragraph("Crystal Tractor — Consolidated Income Statement", H1),
         Paragraph(f"{label}{branch_label}", SUB),
@@ -293,15 +302,21 @@ def main():
     ap = argparse.ArgumentParser(description="Crystal Tractor Income Statement")
     ap.add_argument("--year", type=int, default=None,
                     help="Fiscal year (default: current year, served live via COACMAST.CA_CUR)")
-    ap.add_argument("--period", type=int, default=None, help="Single period YYYYMM (overrides --year, uses GLCAL)")
-    ap.add_argument("--branch", type=str, default=None, help="2-digit branch suffix (e.g. 01); default consolidated")
+    ap.add_argument("--period", type=int, default=None, help="Single period YYYYMM (uses GLCAL)")
+    ap.add_argument("--through", type=int, default=None,
+                    help="YTD through a specific date YYYYMMDD via YTDJRL roll-forward")
+    ap.add_argument("--branch", type=str, default=None, help="2-digit branch suffix; default consolidated")
     ap.add_argument("--output", type=str, default=None)
     args = ap.parse_args()
+    if sum(x is not None for x in (args.year, args.period, args.through)) > 1:
+        ap.error("--year / --period / --through are mutually exclusive")
 
-    rows = fetch_pnl_amounts(args.year, args.period, args.branch)
+    rows = fetch_pnl_amounts(args.year, args.period, args.through, args.branch)
     sections = categorize(rows)
     if args.output is None:
-        if args.period:
+        if args.through:
+            tag = f"through-{args.through}"
+        elif args.period:
             tag = str(args.period)
         elif args.year:
             tag = str(args.year)
@@ -312,7 +327,7 @@ def main():
         out = Path.home() / "Downloads" / f"Crystal-IS-{tag}.pdf"
     else:
         out = Path(args.output)
-    path = build_pdf(args.year, args.period, args.branch, sections, str(out))
+    path = build_pdf(args.year, args.period, args.through, args.branch, sections, str(out))
     print(f"Wrote: {path}")
 
 
