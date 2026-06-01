@@ -14,6 +14,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+from datetime import date
 from pathlib import Path
 
 from reportlab.lib.units import inch
@@ -58,8 +59,12 @@ for sec, _, accts in SECTIONS_BS:
         ACCT_TO_SECTION_BS[a] = sec
 
 
-def fetch_bs_balances(period: int, branch: str | None):
-    """GLCAL.GB_AMT for BS accounts is a running balance — pick the row for the period."""
+def fetch_bs_balances_glcal(period: int, branch: str | None):
+    """Historical period-end balance from GLCAL (BS-account running balance).
+
+    GLCAL only updates when a month closes on the source, so 'latest' here
+    means 'latest closed period' — typically a few months behind today.
+    """
     where = ["am.ACTYP = '1'", f"g.GB_DATE = {period}"]
     if branch:
         where.append(f"RIGHT(RTRIM(g.GB_GLC),2) = '{branch}'")
@@ -76,17 +81,65 @@ def fetch_bs_balances(period: int, branch: str | None):
     return rows
 
 
-def fetch_ytd_ni(year: int, branch: str | None) -> float:
-    """Year-to-date Net Income — used to roll into RE if 2025 hasn't closed."""
-    where = ["am.ACTYP IN ('2','3')", f"g.GB_DATE BETWEEN {year*100+1} AND {year*100+12}"]
+def fetch_bs_balances_live(branch: str | None):
+    """Live current-state balance from COACMAST.CA_CUR.
+
+    Refreshed continuously by the source — includes activity in periods
+    that haven't formally closed yet. This is what 'latest' should mean
+    when a user asks for 'today's balance sheet'.
+    """
+    where = ["am.ACTYP = '1'"]
     if branch:
-        where.append(f"RIGHT(RTRIM(g.GB_GLC),2) = '{branch}'")
+        where.append(f"RIGHT(RTRIM(c.CA_CC),2) = '{branch}'")
     _, rows = fetch(f"""
-    SELECT SUM(g.GB_AMT) FROM dbo.GLCAL g
-    JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = RTRIM(g.GB_GLA)
+    SELECT RTRIM(c.CA_ACC) AS acct,
+           LEFT(RTRIM(am.ACNME), 40) AS name,
+           SUM(c.CA_CUR) AS bal
+    FROM dbo.COACMAST c
+    JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = RTRIM(c.CA_ACC)
     WHERE {' AND '.join(where)}
+    GROUP BY c.CA_ACC, am.ACNME
+    HAVING SUM(c.CA_CUR) <> 0
     """)
-    return -float(rows[0][0] or 0)  # flip sign: net income
+    return rows
+
+
+def fetch_bs_balances(period: int | None, branch: str | None):
+    """Dispatch: period=None → live (CA_CUR), else historical GLCAL period-end."""
+    if period is None:
+        return fetch_bs_balances_live(branch)
+    return fetch_bs_balances_glcal(period, branch)
+
+
+def fetch_ytd_ni(year: int, branch: str | None, *, live: bool = False) -> float:
+    """Year-to-date Net Income — used to roll into RE if year hasn't closed.
+
+    live=False → uses GLCAL (only includes closed periods of the year).
+    live=True  → uses YTDJRL (per-day journal-line postings) for the full
+                 current-year flow including the open periods. This is what
+                 should be added to RE when the BS source is COACMAST.CA_CUR.
+    """
+    if live:
+        where = ["am.ACTYP IN ('2','3')",
+                 f"y.YJ_DT BETWEEN {year*10000 + 101} AND {year*10000 + 1231}"]
+        if branch:
+            where.append(f"RIGHT(RTRIM(y.YJ_CC),2) = '{branch}'")
+        _, rows = fetch(f"""
+        SELECT SUM(y.YJ_AMT) FROM dbo.YTDJRL y
+        JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = RTRIM(y.YJ_ACC)
+        WHERE {' AND '.join(where)}
+        """)
+    else:
+        where = ["am.ACTYP IN ('2','3')",
+                 f"g.GB_DATE BETWEEN {year*100+1} AND {year*100+12}"]
+        if branch:
+            where.append(f"RIGHT(RTRIM(g.GB_GLC),2) = '{branch}'")
+        _, rows = fetch(f"""
+        SELECT SUM(g.GB_AMT) FROM dbo.GLCAL g
+        JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = RTRIM(g.GB_GLA)
+        WHERE {' AND '.join(where)}
+        """)
+    return -float(rows[0][0] or 0)  # flip sign: revenues - expenses = NI
 
 
 def categorize(rows):
@@ -111,15 +164,20 @@ def categorize(rows):
     return sections
 
 
-def build_pdf(period: int, branch: str | None, sections: dict, ytd_ni: float, output_path: str) -> str:
+def build_pdf(period: int | None, branch: str | None, sections: dict, ytd_ni: float, output_path: str) -> str:
     doc = make_doc(output_path, title="Crystal Tractor — Balance Sheet")
     elements: list = []
-    period_label = f"As of {str(period)[:4]}-{str(period)[4:]} period-end"
+    if period is None:
+        period_label = "Live current state (COACMAST.CA_CUR)"
+        source_label = "dbo.COACMAST.CA_CUR (live balance, includes open periods)"
+    else:
+        period_label = f"As of {str(period)[:4]}-{str(period)[4:]} period-end"
+        source_label = "dbo.GLCAL (BS-account period-end running balances)"
     branch_label = f" · Branch {branch}" if branch else " · Consolidated (all entities, divisions, branches)"
     elements += [
         Paragraph("Crystal Tractor — Consolidated Balance Sheet", H1),
         Paragraph(f"{period_label}{branch_label}", SUB),
-        Paragraph(f"Generated {now_str()} · Source: dbo.GLCAL (BS-account running balances)", SMALL),
+        Paragraph(f"Generated {now_str()} · Source: {source_label}", SMALL),
         Spacer(1, 0.15 * inch),
     ]
 
@@ -189,11 +247,13 @@ def build_pdf(period: int, branch: str | None, sections: dict, ytd_ni: float, ou
     # If YTD NI hasn't closed to RE, add it explicitly
     # Pre-close residual = A + L + E in GLCAL sign convention. Add NI (positive)
     # which translates to crediting equity (so equity_total -= ytd_ni in raw sign).
-    year = period // 100
+    from datetime import date as _date
+    year = (period // 100) if period is not None else _date.today().year
     pre_close_residual = asset_total + liab_total + equity_total
     if abs(pre_close_residual) > 1000:
+        ni_label = f"Net Income {year} YTD (not yet closed to Retained Earnings)"
         elements.append(Paragraph(
-            f"<b>Net Income {year} (not yet closed to Retained Earnings):</b> {fmt_money(ytd_ni)} — added to Equity for balance.",
+            f"<b>{ni_label}:</b> {fmt_money(ytd_ni)} — added to Equity for balance.",
             SMALL))
         equity_total -= ytd_ni
 
@@ -217,11 +277,18 @@ def build_pdf(period: int, branch: str | None, sections: dict, ytd_ni: float, ou
     elements.append(bal_t)
 
     elements.append(Spacer(1, 0.15*inch))
+    src_note = (
+        "Source: dbo.COACMAST.CA_CUR (live current-state balance, refreshed continuously; includes "
+        "activity in periods that have not closed on the source yet — i.e., 'as of today')."
+        if period is None else
+        "Source: dbo.GLCAL · BS accounts (ACTYP='1') carry period-end running balances; updated only "
+        "when a month closes on the source."
+    )
     elements.append(Paragraph(
-        "Source: dbo.GLCAL · BS accounts (ACTYP='1') carry period-end running balances; "
-        "current-year NI rolled into Equity if year-end close hasn't posted to RE on the source. "
-        "v2 CFO section overlay applied (Cash split 4 ways; Reserves pulled into own section; Intercompany Liabilities new; "
-        "PP&E grouped with accumulated depreciation). Accounts not in the section map fall through to nearest catchall.",
+        f"{src_note} Current-year NI rolled into Equity when year-end close hasn't posted to RE. "
+        "v2 CFO section overlay applied (Cash split 4 ways; Reserves pulled into own section; "
+        "Intercompany Liabilities new; PP&E grouped with accumulated depreciation). "
+        "Accounts not in the section map fall through to the nearest catchall.",
         SMALL))
 
     doc.build(elements)
@@ -230,22 +297,25 @@ def build_pdf(period: int, branch: str | None, sections: dict, ytd_ni: float, ou
 
 def main():
     ap = argparse.ArgumentParser(description="Crystal Tractor Balance Sheet")
-    # Default: most recent closed period in GLCAL
-    ap.add_argument("--period", type=int, default=None, help="Period YYYYMM (default: most recent closed)")
-    ap.add_argument("--branch", type=str, default=None)
+    ap.add_argument("--period", type=int, default=None,
+                    help="Period YYYYMM for historical period-end (default: live via COACMAST.CA_CUR)")
+    ap.add_argument("--branch", type=str, default=None,
+                    help="2-digit branch suffix (e.g. 14); default consolidated")
     ap.add_argument("--output", type=str, default=None)
     args = ap.parse_args()
 
-    if args.period is None:
-        _, row = fetch("SELECT MAX(GB_DATE) FROM dbo.GLCAL")
-        args.period = int(row[0][0])
-
     rows = fetch_bs_balances(args.period, args.branch)
     sections = categorize(rows)
-    year = args.period // 100
-    ytd_ni = fetch_ytd_ni(year, args.branch)
+    # For live mode, roll in YTD NI from YTDJRL (current year). For historical
+    # period mode, roll in YTD NI from GLCAL for that period's year.
+    if args.period is None:
+        year = date.today().year
+        ytd_ni = fetch_ytd_ni(year, args.branch, live=True)
+    else:
+        year = args.period // 100
+        ytd_ni = fetch_ytd_ni(year, args.branch, live=False)
     if args.output is None:
-        tag = str(args.period)
+        tag = (str(args.period) if args.period is not None else f"live-{date.today().isoformat()}")
         if args.branch:
             tag += f"-br{args.branch}"
         out = Path.home() / "Downloads" / f"Crystal-BS-{tag}.pdf"
