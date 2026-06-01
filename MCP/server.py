@@ -721,16 +721,56 @@ async def ap_analysis(period_from: str, period_to: str) -> str:
 
 
 @mcp.tool()
-async def balance_sheet_v2(period: str, branch: str | None = None) -> str:
+async def balance_sheet_v2(period: str | None = None, branch: str | None = None) -> str:
     """Consolidated balance sheet section subtotals using v2 CFO layout.
 
     Args:
-        period: 'YYYY-MM' or 'YYYYMM' (e.g. '2025-12' or 202512)
+        period: 'YYYY-MM' or 'YYYYMM' for historical period-end via GLCAL.
+                If omitted, returns LIVE current-state balances via COACMAST.CA_CUR
+                (includes activity in periods that haven't closed on the source).
         branch: optional 2-digit branch suffix (e.g. '14' for Tallahassee)
 
-    Returns section totals (Cash, AR, Inventory, PP&E, etc.) by joining
-    GLCAL BS-account balances to ACCMAST. Run the CLI script for the full PDF.
+    Returns section totals (Cash, AR, Inventory, PP&E, etc.). Run the CLI
+    script (scripts/reports/balance_sheet.py) for the full PDF.
     """
+    if period is None:
+        # Live mode via CA_CUR
+        section_case_live = """
+        CASE
+          WHEN RTRIM(c.CA_ACC) IN ('10100','10110','10113','10114','10140','10150','10151','10160','10170') THEN 'Cash & Equivalents'
+          WHEN RTRIM(c.CA_ACC) IN ('10200','10204','10210','10224','10230','10241','10242','10245','10246') THEN 'Accounts Receivable'
+          WHEN RTRIM(c.CA_ACC) IN ('10180','10182') THEN 'Intercompany (asset)'
+          WHEN RTRIM(c.CA_ACC) IN ('12000','12007') THEN 'Inventory - Wholegoods'
+          WHEN RTRIM(c.CA_ACC) IN ('13000','13900') THEN 'Inventory - Parts'
+          WHEN RTRIM(c.CA_ACC) IN ('14000','14100','14200') THEN 'Work-in-Process'
+          WHEN RTRIM(c.CA_ACC) IN ('12100','13010') THEN 'Reserves'
+          WHEN LEFT(RTRIM(c.CA_ACC),2) IN ('15','16') THEN 'PP&E (net)'
+          WHEN LEFT(RTRIM(c.CA_ACC),2) = '17' THEN 'Intangibles & Other'
+          WHEN RTRIM(c.CA_ACC) = '20350' THEN 'Floorplan'
+          WHEN RTRIM(c.CA_ACC) IN ('20100','20200','20300','20500','20600') THEN 'AP & Taxes'
+          WHEN LEFT(RTRIM(c.CA_ACC),2) = '21' THEN 'Accrued Expenses'
+          WHEN RTRIM(c.CA_ACC) IN ('24050','24060','24070') THEN 'Related Party Loans'
+          WHEN RTRIM(c.CA_ACC) = '24900' THEN 'Intercompany Liabilities'
+          WHEN LEFT(RTRIM(c.CA_ACC),2) = '25' THEN 'Notes Payable - LT'
+          WHEN LEFT(RTRIM(c.CA_ACC),2) IN ('27','28','29') THEN 'Equity'
+          ELSE 'Other ' + CASE WHEN am.ACTYP='1' THEN 'Asset' ELSE 'Liab/Equity' END
+        END
+        """
+        where = ["am.ACTYP = '1'"]
+        if branch:
+            where.append("RIGHT(RTRIM(c.CA_CC),2) = ?")
+        sql = f"""
+        SELECT {section_case_live} AS Section, SUM(c.CA_CUR) AS Balance
+        FROM dbo.COACMAST c
+        JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = RTRIM(c.CA_ACC)
+        WHERE {' AND '.join(where)}
+        GROUP BY {section_case_live}
+        HAVING SUM(c.CA_CUR) <> 0
+        ORDER BY Balance DESC
+        """
+        r = _exec(sql, (branch.strip(),) if branch else ())
+        return _result_to_text(r, extra_meta={"mode": "live", "source": "COACMAST.CA_CUR", "branch": branch})
+
     try:
         per = _parse_period(period)
     except ValueError as e:
@@ -773,13 +813,19 @@ async def balance_sheet_v2(period: str, branch: str | None = None) -> str:
 
 
 @mcp.tool()
-async def cash_flow(year: int, branch: str | None = None) -> str:
+async def cash_flow(year: int | None = None, branch: str | None = None) -> str:
     """Cash flow statement (indirect method) for a fiscal year.
 
-    Computes Operating (NI + D&A + WC changes), Investing (PP&E +
-    Intangibles), Financing (notes, intercompany, floorplan, equity)
-    from BS deltas between (year-1)-12 and year-12.
+    If year is omitted, returns current YTD with EOY served live from
+    COACMAST.CA_CUR (BOY still from GLCAL prior year-end). For historical
+    years, uses GLCAL closed-period balances for both endpoints.
+
+    Run scripts/reports/cash_flow.py for the full PDF including per-line
+    working-capital, investing, and financing breakdowns.
     """
+    from datetime import date as _date
+    if year is None:
+        year = _date.today().year
     boy = (year - 1) * 100 + 12
     eoy = year * 100 + 12
     branch_filter = "AND RIGHT(RTRIM(g.GB_GLC),2) = ?" if branch else ""
@@ -820,16 +866,52 @@ async def cash_flow(year: int, branch: str | None = None) -> str:
 
 
 @mcp.tool()
-async def dfs_departmental(year: int) -> str:
+async def dfs_departmental(year: int | None = None) -> str:
     """Kubota DFS departmental P&L for a fiscal year.
+
+    If year is omitted (or matches current year), pulls live YTD figures
+    from COACMAST.CA_CUR. Otherwise pulls full-year aggregate from GLCAL.
 
     Returns per-dept (Sales/Service/Parts/Rental/Admin) and consolidated
     revenue, COGS, gross profit, OpEx, EBITDA, D&A, Operating Income,
     Interest, Other, Net Income. Dept from CC leading digit.
 
     For the full 7-column PDF (with $K formatting, color bands),
-    run scripts/reports/dfs_departmental.py --year YYYY.
+    run scripts/reports/dfs_departmental.py [--year YYYY].
     """
+    from datetime import date as _date
+    use_live = year is None or year == _date.today().year
+    if use_live:
+        sql = """
+        WITH base AS (
+            SELECT LEFT(RTRIM(c.CA_CC),1) AS dept,
+                   CASE
+                     WHEN am.ACTYP='2' AND LEFT(RTRIM(am.ACACC),1)='3' AND am.ACACC NOT IN ('42210','42005','42212') THEN 'Revenue'
+                     WHEN am.ACTYP='2' AND LEFT(RTRIM(am.ACACC),1)='4' AND am.ACACC NOT IN ('42210','42005','42212') THEN 'COGS'
+                     WHEN RTRIM(am.ACACC) = '51910' THEN 'Variable'
+                     WHEN am.ACTYP='3' AND LEFT(RTRIM(am.ACACC),2) = '51' AND RTRIM(am.ACACC) <> '51910' THEN 'Personnel'
+                     WHEN am.ACTYP='3' AND LEFT(RTRIM(am.ACACC),2) IN ('52','53','54','56','57','58')
+                          AND RTRIM(am.ACACC) NOT IN ('58200','58290','58310','55100','55300','55400') THEN 'Operating'
+                     WHEN am.ACTYP='3' AND LEFT(RTRIM(am.ACACC),3) = '590' THEN 'Fixed'
+                     WHEN RTRIM(am.ACACC) IN ('55100','55300','55400') THEN 'DA'
+                     WHEN RTRIM(am.ACACC) IN ('58200','58290','59100') THEN 'Interest'
+                     WHEN am.ACTYP IN ('2','3') AND LEFT(RTRIM(am.ACACC),1) IN ('6','7') THEN 'Other'
+                     ELSE 'Unclassified'
+                   END AS line,
+                   c.CA_CUR AS amt
+            FROM dbo.COACMAST c
+            JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = RTRIM(c.CA_ACC)
+            WHERE am.ACTYP IN ('2','3') AND LEN(RTRIM(c.CA_CC)) >= 3
+        )
+        SELECT
+          CASE dept WHEN '2' THEN 'Sales' WHEN '3' THEN 'Service' WHEN '4' THEN 'Parts'
+                    WHEN '5' THEN 'Rental' WHEN '1' THEN 'Admin' WHEN '0' THEN 'Corp' ELSE dept END AS dept,
+          line, -SUM(amt) AS amount
+        FROM base GROUP BY dept, line ORDER BY dept, line
+        """
+        r = _exec(sql)
+        return _result_to_text(r, extra_meta={"mode": "live", "source": "COACMAST.CA_CUR"})
+
     sql = f"""
     WITH base AS (
         SELECT LEFT(RTRIM(g.GB_GLC),1) AS dept,

@@ -28,9 +28,15 @@ from _common import (
 DEPTS = [("Sales", "2"), ("Service", "3"), ("Parts", "4"), ("Rental", "5"), ("Admin", "1")]
 
 
-def fetch_dept_pnl(year: int):
-    """Return dict[dept_digit][line_name] = amount (in $)."""
-    # Section maps reused from income_statement.py (subset)
+def fetch_dept_pnl(year: int | None):
+    """Return dict[dept_digit][line_name] = amount (in $).
+
+    year=None or current year → live via COACMAST.CA_CUR (includes open periods).
+    year given (historical) → GLCAL full-year aggregate.
+    """
+    from datetime import date as _d
+    use_live = year is None or year == _d.today().year
+
     SECTIONS = {
         "Revenue":         "am.ACTYP = '2' AND LEFT(RTRIM(am.ACACC),1) IN ('3') AND am.ACACC NOT IN ('42210','42005','42212')",
         "COGS":            "am.ACTYP = '2' AND LEFT(RTRIM(am.ACACC),1) = '4' AND am.ACACC NOT IN ('42210','42005','42212')",
@@ -46,36 +52,47 @@ def fetch_dept_pnl(year: int):
     data["consolidated"] = {}
 
     for line, where in SECTIONS.items():
-        cols, rows = fetch(f"""
-        SELECT LEFT(RTRIM(g.GB_GLC),1) AS dept, SUM(g.GB_AMT) AS s
-        FROM dbo.GLCAL g
-        JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = RTRIM(g.GB_GLA)
-        WHERE g.GB_DATE BETWEEN {year*100+1} AND {year*100+12}
-          AND LEN(RTRIM(g.GB_GLC)) >= 3
-          AND ({where})
-        GROUP BY LEFT(RTRIM(g.GB_GLC),1)
-        """)
+        if use_live:
+            sql = f"""
+            SELECT LEFT(RTRIM(c.CA_CC),1) AS dept, SUM(c.CA_CUR) AS s
+            FROM dbo.COACMAST c
+            JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = RTRIM(c.CA_ACC)
+            WHERE LEN(RTRIM(c.CA_CC)) >= 3 AND ({where})
+            GROUP BY LEFT(RTRIM(c.CA_CC),1)
+            """
+        else:
+            sql = f"""
+            SELECT LEFT(RTRIM(g.GB_GLC),1) AS dept, SUM(g.GB_AMT) AS s
+            FROM dbo.GLCAL g
+            JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = RTRIM(g.GB_GLA)
+            WHERE g.GB_DATE BETWEEN {year*100+1} AND {year*100+12}
+              AND LEN(RTRIM(g.GB_GLC)) >= 3
+              AND ({where})
+            GROUP BY LEFT(RTRIM(g.GB_GLC),1)
+            """
+        _, rows = fetch(sql)
         for dept, s in rows:
             amt = float(s or 0)
-            # Revenue: stored negative in GLCAL → display positive
-            # COGS, expenses: positive → display negative
-            if line == "Revenue":
-                amt = -amt
-            else:
-                amt = -amt  # expense in GLCAL is positive → display negative
+            # Revenue stored negative; expense positive — both flip on display
+            amt = -amt
             data.setdefault(dept, {})[line] = amt
             data["consolidated"][line] = data["consolidated"].get(line, 0) + amt
 
     return data
 
 
-def build_pdf(year: int, data: dict, output_path: str) -> str:
+def build_pdf(year: int | None, data: dict, output_path: str) -> str:
     doc = make_doc(output_path, title="Crystal Tractor — Kubota DFS Departmental")
     elements: list = []
+    from datetime import date as _d
+    is_live = year is None or year == _d.today().year
+    period_label = (f"YTD {_d.today().year} (live, through latest source update)"
+                    if is_live else f"Fiscal Year {year}")
+    source_label = "dbo.COACMAST.CA_CUR (live)" if is_live else "dbo.GLCAL"
     elements += [
         Paragraph("Crystal Tractor — Kubota DFS Departmental P&L", H1),
-        Paragraph(f"Fiscal Year {year} · Amounts in $K · Dept from CC leading digit", SUB),
-        Paragraph(f"Generated {now_str()} · Source: dbo.GLCAL", SMALL),
+        Paragraph(f"{period_label} · Amounts in $K · Dept from CC leading digit", SUB),
+        Paragraph(f"Generated {now_str()} · Source: {source_label}", SMALL),
         Spacer(1, 0.2 * inch),
     ]
 
@@ -202,11 +219,13 @@ def build_pdf(year: int, data: dict, output_path: str) -> str:
 
 def main():
     ap = argparse.ArgumentParser(description="Crystal Tractor Kubota DFS Departmental P&L")
-    ap.add_argument("--year", type=int, default=date.today().year - 1)
+    ap.add_argument("--year", type=int, default=None,
+                    help="Fiscal year (default: current year, live via COACMAST.CA_CUR)")
     ap.add_argument("--output", type=str, default=None)
     args = ap.parse_args()
     if args.output is None:
-        out = Path.home() / "Downloads" / f"Crystal-IS-Kubota-DFS-{args.year}.pdf"
+        tag = str(args.year) if args.year else f"YTD-{date.today().isoformat()}"
+        out = Path.home() / "Downloads" / f"Crystal-IS-Kubota-DFS-{tag}.pdf"
     else:
         out = Path(args.output)
     data = fetch_dept_pnl(args.year)

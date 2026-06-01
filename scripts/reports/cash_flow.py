@@ -61,8 +61,22 @@ DA_ACCTS = ["55100", "55300", "55400"]
 CASH_ACCTS = ["10100", "10110", "10113", "10114", "10140", "10150", "10151", "10160", "10170"]
 
 
-def balance(period: int, accts: list[str], branch: str | None) -> float:
-    """Sum GB_AMT for given accounts at period-end (BS running balance)."""
+def balance(period: int | None, accts: list[str], branch: str | None) -> float:
+    """Sum balance for given accounts at a date.
+
+    period=None  → live snapshot via COACMAST.CA_CUR
+    period given → GLCAL period-end running balance
+    """
+    if period is None:
+        where = [f"RTRIM(c.CA_ACC) IN ({','.join('?' for _ in accts)})"]
+        if branch:
+            where.append(f"RIGHT(RTRIM(c.CA_CC),2) = '{branch}'")
+        _, rows = fetch(
+            f"SELECT SUM(c.CA_CUR) FROM dbo.COACMAST c WHERE {' AND '.join(where)}",
+            tuple(accts),
+        )
+        return float(rows[0][0] or 0)
+
     where = [f"g.GB_DATE = {period}", f"RTRIM(g.GB_GLA) IN ({','.join('?' for _ in accts)})"]
     if branch:
         where.append(f"RIGHT(RTRIM(g.GB_GLC),2) = '{branch}'")
@@ -73,8 +87,17 @@ def balance(period: int, accts: list[str], branch: str | None) -> float:
     return float(rows[0][0] or 0)
 
 
-def yearly_activity(year: int, accts: list[str], branch: str | None) -> float:
-    """Sum GB_AMT across all months of year for P&L accounts."""
+def yearly_activity(year: int, accts: list[str], branch: str | None, *, live: bool = False) -> float:
+    """Sum P&L activity for the year. live=True pulls from CA_CUR (includes open periods)."""
+    if live:
+        where = [f"RTRIM(c.CA_ACC) IN ({','.join('?' for _ in accts)})"]
+        if branch:
+            where.append(f"RIGHT(RTRIM(c.CA_CC),2) = '{branch}'")
+        _, rows = fetch(
+            f"SELECT SUM(c.CA_CUR) FROM dbo.COACMAST c WHERE {' AND '.join(where)}",
+            tuple(accts),
+        )
+        return float(rows[0][0] or 0)
     where = [f"g.GB_DATE BETWEEN {year*100+1} AND {year*100+12}",
              f"RTRIM(g.GB_GLA) IN ({','.join('?' for _ in accts)})"]
     if branch:
@@ -86,7 +109,17 @@ def yearly_activity(year: int, accts: list[str], branch: str | None) -> float:
     return float(rows[0][0] or 0)
 
 
-def ytd_ni(year: int, branch: str | None) -> float:
+def ytd_ni(year: int, branch: str | None, *, live: bool = False) -> float:
+    if live:
+        where = ["am.ACTYP IN ('2','3')"]
+        if branch:
+            where.append(f"RIGHT(RTRIM(c.CA_CC),2) = '{branch}'")
+        _, rows = fetch(f"""
+            SELECT SUM(c.CA_CUR) FROM dbo.COACMAST c
+            JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = RTRIM(c.CA_ACC)
+            WHERE {' AND '.join(where)}
+        """)
+        return -float(rows[0][0] or 0)
     where = ["am.ACTYP IN ('2','3')", f"g.GB_DATE BETWEEN {year*100+1} AND {year*100+12}"]
     if branch:
         where.append(f"RIGHT(RTRIM(g.GB_GLC),2) = '{branch}'")
@@ -98,22 +131,29 @@ def ytd_ni(year: int, branch: str | None) -> float:
     return -float(rows[0][0] or 0)
 
 
-def build_pdf(year: int, branch: str | None, output_path: str) -> str:
-    eoy_period = year * 100 + 12
-    boy_period = (year - 1) * 100 + 12
+def build_pdf(year: int | None, branch: str | None, output_path: str) -> str:
+    from datetime import date as _d
+    is_live = year is None or year == _d.today().year
+    eff_year = _d.today().year if is_live else year
+    eoy_period = None if is_live else eff_year * 100 + 12   # None → live CA_CUR
+    boy_period = (eff_year - 1) * 100 + 12                  # always GLCAL prior year-end
 
     doc = make_doc(output_path, title="Crystal Tractor — Cash Flow")
     elements: list = []
     branch_label = f" · Branch {branch}" if branch else " · Consolidated"
+    period_label = (f"YTD {eff_year} (live, BOY {eff_year-1}-12 from GLCAL → EOY live from CA_CUR)"
+                    if is_live else f"Fiscal Year {eff_year}")
+    source_label = ("BOY: dbo.GLCAL · EOY: dbo.COACMAST.CA_CUR (live)"
+                    if is_live else "dbo.GLCAL (closed periods)")
     elements += [
         Paragraph("Crystal Tractor — Consolidated Statement of Cash Flows", H1),
-        Paragraph(f"Fiscal Year {year} · Indirect Method{branch_label}", SUB),
-        Paragraph(f"Generated {now_str()} · Source: dbo.GLCAL", SMALL),
+        Paragraph(f"{period_label} · Indirect Method{branch_label}", SUB),
+        Paragraph(f"Generated {now_str()} · Source: {source_label}", SMALL),
         Spacer(1, 0.15 * inch),
     ]
 
-    ni = ytd_ni(year, branch)
-    da = -yearly_activity(year, DA_ACCTS, branch)  # expense → positive cash add-back
+    ni = ytd_ni(eff_year, branch, live=is_live)
+    da = -yearly_activity(eff_year, DA_ACCTS, branch, live=is_live)  # expense → positive cash add-back
 
     # OPERATING
     elements.append(Paragraph("CASH FROM OPERATING ACTIVITIES", H2))
@@ -196,10 +236,11 @@ def build_pdf(year: int, branch: str | None, output_path: str) -> str:
     actual_change = end_cash - begin_cash
     residual = actual_change - net_per_cf
 
+    end_label = f"{eff_year}-12" if not is_live else "today (live CA_CUR)"
     rec_rows = [
         ["NET CHANGE IN CASH (per cash flow)", fmt_money(net_per_cf)],
-        [f"  Beginning Cash ({year-1}-12)", fmt_money(begin_cash)],
-        [f"  Ending Cash ({year}-12)", fmt_money(end_cash)],
+        [f"  Beginning Cash ({eff_year-1}-12)", fmt_money(begin_cash)],
+        [f"  Ending Cash ({end_label})", fmt_money(end_cash)],
         ["  Actual Δ Cash from balance sheet", fmt_money(actual_change)],
         ["  Reconciliation residual (DISCUSS)", fmt_money(residual)],
     ]
@@ -226,12 +267,15 @@ def build_pdf(year: int, branch: str | None, output_path: str) -> str:
 
 def main():
     ap = argparse.ArgumentParser(description="Crystal Tractor Cash Flow Statement")
-    ap.add_argument("--year", type=int, default=date.today().year - 1)
+    ap.add_argument("--year", type=int, default=None,
+                    help="Fiscal year (default: current year, EOY served live via COACMAST.CA_CUR)")
     ap.add_argument("--branch", type=str, default=None)
     ap.add_argument("--output", type=str, default=None)
     args = ap.parse_args()
     if args.output is None:
-        tag = str(args.year) + (f"-br{args.branch}" if args.branch else "")
+        tag = str(args.year) if args.year else f"YTD-{date.today().isoformat()}"
+        if args.branch:
+            tag += f"-br{args.branch}"
         out = Path.home() / "Downloads" / f"Crystal-Cash-Flow-{tag}.pdf"
     else:
         out = Path(args.output)

@@ -71,12 +71,34 @@ for sec_name, _kind, accts in SECTIONS_IS:
         ACCT_TO_SECTION[a] = sec_name
 
 
-def fetch_pnl_amounts(year: int, period: int | None, branch: str | None):
+def fetch_pnl_amounts(year: int | None, period: int | None, branch: str | None):
     """Sum GLCAL.GB_AMT for P&L accounts; group by (account, name).
 
-    If period is given (YYYYMM), restrict to that month. Otherwise full year.
-    branch is the 2-digit CC suffix; None = consolidated.
+    Source dispatch:
+      - period given (YYYYMM): GLCAL single-month
+      - year given (and != current): GLCAL annual
+      - year=None or current year (default): COACMAST.CA_CUR — live YTD,
+        includes activity in open periods that haven't closed on the source
     """
+    from datetime import date as _d
+    use_live = (period is None and (year is None or year == _d.today().year))
+
+    if use_live:
+        where = ["am.ACTYP IN ('2','3')"]
+        if branch:
+            where.append(f"RIGHT(RTRIM(c.CA_CC),2) = '{branch}'")
+        _, rows = fetch(f"""
+        SELECT RTRIM(c.CA_ACC) AS acct,
+               LEFT(RTRIM(am.ACNME), 40) AS name,
+               SUM(c.CA_CUR) AS amt
+        FROM dbo.COACMAST c
+        JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = RTRIM(c.CA_ACC)
+        WHERE {' AND '.join(where)}
+        GROUP BY c.CA_ACC, am.ACNME
+        HAVING SUM(c.CA_CUR) <> 0
+        """)
+        return rows
+
     where = ["am.ACTYP IN ('2','3')"]
     if period is not None:
         where.append(f"g.GB_DATE = {period}")
@@ -85,7 +107,7 @@ def fetch_pnl_amounts(year: int, period: int | None, branch: str | None):
     if branch:
         where.append(f"RIGHT(RTRIM(g.GB_GLC),2) = '{branch}'")
 
-    cols, rows = fetch(f"""
+    _, rows = fetch(f"""
     SELECT RTRIM(g.GB_GLA) AS acct,
            LEFT(RTRIM(am.ACNME), 40) AS name,
            SUM(g.GB_AMT) AS amt
@@ -131,18 +153,23 @@ def categorize(rows):
     return sections
 
 
-def build_pdf(year: int, period: int | None, branch: str | None, sections: dict, output_path: str) -> str:
+def build_pdf(year: int | None, period: int | None, branch: str | None, sections: dict, output_path: str) -> str:
     doc = make_doc(output_path, title="Crystal Tractor — Income Statement")
     elements: list = []
-    label = (
-        f"Fiscal Year {year}" if period is None
-        else f"Period {str(period)[:4]}-{str(period)[4:]}"
-    )
+    from datetime import date as _d
+    is_live = period is None and (year is None or year == _d.today().year)
+    if period is not None:
+        label = f"Period {str(period)[:4]}-{str(period)[4:]}"
+    elif is_live:
+        label = f"YTD {_d.today().year} (live, through latest source update)"
+    else:
+        label = f"Fiscal Year {year}"
     branch_label = f" · Branch {branch}" if branch else " · Consolidated"
+    source_label = "dbo.COACMAST.CA_CUR (live)" if is_live else "dbo.GLCAL"
     elements += [
         Paragraph("Crystal Tractor — Consolidated Income Statement", H1),
         Paragraph(f"{label}{branch_label}", SUB),
-        Paragraph(f"Generated {now_str()} · Source: dbo.GLCAL", SMALL),
+        Paragraph(f"Generated {now_str()} · Source: {source_label}", SMALL),
         Spacer(1, 0.15 * inch),
     ]
 
@@ -264,8 +291,9 @@ def build_pdf(year: int, period: int | None, branch: str | None, sections: dict,
 
 def main():
     ap = argparse.ArgumentParser(description="Crystal Tractor Income Statement")
-    ap.add_argument("--year", type=int, default=date.today().year - 1, help="Fiscal year (default: previous year)")
-    ap.add_argument("--period", type=int, default=None, help="Single period YYYYMM (overrides --year)")
+    ap.add_argument("--year", type=int, default=None,
+                    help="Fiscal year (default: current year, served live via COACMAST.CA_CUR)")
+    ap.add_argument("--period", type=int, default=None, help="Single period YYYYMM (overrides --year, uses GLCAL)")
     ap.add_argument("--branch", type=str, default=None, help="2-digit branch suffix (e.g. 01); default consolidated")
     ap.add_argument("--output", type=str, default=None)
     args = ap.parse_args()
@@ -273,7 +301,12 @@ def main():
     rows = fetch_pnl_amounts(args.year, args.period, args.branch)
     sections = categorize(rows)
     if args.output is None:
-        tag = str(args.period) if args.period else str(args.year)
+        if args.period:
+            tag = str(args.period)
+        elif args.year:
+            tag = str(args.year)
+        else:
+            tag = f"YTD-{date.today().isoformat()}"
         if args.branch:
             tag += f"-br{args.branch}"
         out = Path.home() / "Downloads" / f"Crystal-IS-{tag}.pdf"
