@@ -90,18 +90,24 @@ def fetch_ytd_ni(year: int, branch: str | None) -> float:
 
 
 def categorize(rows):
+    """Assign each (acct, name, amt) to exactly one section. Unknown accounts
+    fall through to one of: Other Assets / Other Current Liabilities / Equity
+    based on account-number prefix."""
     sections: dict[str, list[tuple[str, str, float]]] = {sec: [] for sec, _, _ in SECTIONS_BS}
-    other = []
     for acct, name, amt in rows:
+        amt_f = float(amt)
         sec = ACCT_TO_SECTION_BS.get(acct)
-        if sec is None:
-            other.append((acct, name, float(amt)))
-        else:
-            sections[sec].append((acct, name, float(amt)))
-    if other:
-        sections.setdefault("Other Assets", []).extend([(a, n, v) for a, n, v in other if not a.startswith("2") and not a.startswith("27")])
-        sections.setdefault("Other Current Liabilities", []).extend([(a, n, v) for a, n, v in other if a.startswith("2") and not a.startswith("27")])
-        sections.setdefault("Equity", []).extend([(a, n, v) for a, n, v in other if a.startswith("27") or a.startswith("28") or a.startswith("29")])
+        if sec is not None:
+            sections[sec].append((acct, name, amt_f))
+            continue
+        # Catchall — note the order matters: equity (27/28/29) must be checked
+        # BEFORE the broader "starts with 2" liability bucket.
+        if acct.startswith(("27", "28", "29")):
+            sections.setdefault("Equity", []).append((acct, name, amt_f))
+        elif acct.startswith("2"):
+            sections.setdefault("Other Current Liabilities", []).append((acct, name, amt_f))
+        else:  # 1xxxx — assets
+            sections.setdefault("Other Assets", []).append((acct, name, amt_f))
     return sections
 
 
