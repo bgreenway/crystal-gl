@@ -310,7 +310,7 @@ async def pnl_through(
         WITH lines AS (
           SELECT
             CASE
-              WHEN am.ACTYP='2' AND LEFT(RTRIM(am.ACACC),1)='3' AND am.ACACC NOT IN ('42210','42005','42212') THEN 'Revenue'
+              WHEN am.ACACC IN ('42210','42005','42212') THEN 'Revenue' WHEN am.ACTYP='2' AND LEFT(RTRIM(am.ACACC),1)='3' THEN 'Revenue'
               WHEN am.ACTYP='2' AND LEFT(RTRIM(am.ACACC),1)='4' AND am.ACACC NOT IN ('42210','42005','42212') THEN 'COGS'
               WHEN RTRIM(am.ACACC) = '51910' THEN 'Variable Expense'
               WHEN am.ACTYP='3' AND LEFT(RTRIM(am.ACACC),2) = '51' AND RTRIM(am.ACACC) <> '51910' THEN 'Personnel'
@@ -1134,7 +1134,7 @@ async def dfs_departmental(year: int | None = None) -> str:
         WITH base AS (
             SELECT LEFT(RTRIM(c.CA_CC),1) AS dept,
                    CASE
-                     WHEN am.ACTYP='2' AND LEFT(RTRIM(am.ACACC),1)='3' AND am.ACACC NOT IN ('42210','42005','42212') THEN 'Revenue'
+                     WHEN am.ACACC IN ('42210','42005','42212') THEN 'Revenue' WHEN am.ACTYP='2' AND LEFT(RTRIM(am.ACACC),1)='3' THEN 'Revenue'
                      WHEN am.ACTYP='2' AND LEFT(RTRIM(am.ACACC),1)='4' AND am.ACACC NOT IN ('42210','42005','42212') THEN 'COGS'
                      WHEN RTRIM(am.ACACC) = '51910' THEN 'Variable'
                      WHEN am.ACTYP='3' AND LEFT(RTRIM(am.ACACC),2) = '51' AND RTRIM(am.ACACC) <> '51910' THEN 'Personnel'
@@ -1164,7 +1164,7 @@ async def dfs_departmental(year: int | None = None) -> str:
     WITH base AS (
         SELECT LEFT(RTRIM(g.GB_GLC),1) AS dept,
                CASE
-                 WHEN am.ACTYP='2' AND LEFT(RTRIM(am.ACACC),1)='3' AND am.ACACC NOT IN ('42210','42005','42212') THEN 'Revenue'
+                 WHEN am.ACACC IN ('42210','42005','42212') THEN 'Revenue' WHEN am.ACTYP='2' AND LEFT(RTRIM(am.ACACC),1)='3' THEN 'Revenue'
                  WHEN am.ACTYP='2' AND LEFT(RTRIM(am.ACACC),1)='4' AND am.ACACC NOT IN ('42210','42005','42212') THEN 'COGS'
                  WHEN RTRIM(am.ACACC) = '51910' THEN 'Variable'
                  WHEN am.ACTYP='3' AND LEFT(RTRIM(am.ACACC),2) = '51' AND RTRIM(am.ACACC) <> '51910' THEN 'Personnel'

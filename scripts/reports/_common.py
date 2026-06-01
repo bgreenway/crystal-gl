@@ -278,7 +278,7 @@ def pnl_activity_through(through: int, branch: str | None, *, group_by_cc_digit:
     _, rows = fetch(f"""
     SELECT LEFT(RTRIM(y.YJ_CC),1) AS dept,
            CASE
-             WHEN am.ACTYP='2' AND LEFT(RTRIM(am.ACACC),1)='3' AND am.ACACC NOT IN ('42210','42005','42212') THEN 'Revenue'
+             WHEN am.ACACC IN ('42210','42005','42212') THEN 'Revenue' WHEN am.ACTYP='2' AND LEFT(RTRIM(am.ACACC),1)='3' THEN 'Revenue'
              WHEN am.ACTYP='2' AND LEFT(RTRIM(am.ACACC),1)='4' AND am.ACACC NOT IN ('42210','42005','42212') THEN 'COGS'
              WHEN RTRIM(am.ACACC) = '51910' THEN 'Variable'
              WHEN am.ACTYP='3' AND LEFT(RTRIM(am.ACACC),2) = '51' AND RTRIM(am.ACACC) <> '51910' THEN 'Personnel'
@@ -298,7 +298,7 @@ def pnl_activity_through(through: int, branch: str | None, *, group_by_cc_digit:
       AND LEN(RTRIM(y.YJ_CC)) >= 3
     GROUP BY LEFT(RTRIM(y.YJ_CC),1),
              CASE
-               WHEN am.ACTYP='2' AND LEFT(RTRIM(am.ACACC),1)='3' AND am.ACACC NOT IN ('42210','42005','42212') THEN 'Revenue'
+               WHEN am.ACACC IN ('42210','42005','42212') THEN 'Revenue' WHEN am.ACTYP='2' AND LEFT(RTRIM(am.ACACC),1)='3' THEN 'Revenue'
                WHEN am.ACTYP='2' AND LEFT(RTRIM(am.ACACC),1)='4' AND am.ACACC NOT IN ('42210','42005','42212') THEN 'COGS'
                WHEN RTRIM(am.ACACC) = '51910' THEN 'Variable'
                WHEN am.ACTYP='3' AND LEFT(RTRIM(am.ACACC),2) = '51' AND RTRIM(am.ACACC) <> '51910' THEN 'Personnel'

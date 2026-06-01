@@ -61,7 +61,9 @@ def fetch_dept_pnl(year: int | None, through: int | None = None):
     use_live = year is None or year == _d.today().year
 
     SECTIONS = {
-        "Revenue":         "am.ACTYP = '2' AND LEFT(RTRIM(am.ACACC),1) IN ('3') AND am.ACACC NOT IN ('42210','42005','42212')",
+        # CFO v2 action 2.4: 42210/42005/42212 are contra-revenue → Revenue section,
+        # not COGS. Listed explicitly here AND excluded from COGS below.
+        "Revenue":         "(am.ACTYP = '2' AND LEFT(RTRIM(am.ACACC),1) = '3') OR am.ACACC IN ('42210','42005','42212')",
         "COGS":            "am.ACTYP = '2' AND LEFT(RTRIM(am.ACACC),1) = '4' AND am.ACACC NOT IN ('42210','42005','42212')",
         "Variable Exp":    "am.ACTYP = '3' AND RTRIM(am.ACACC) = '51910'",
         "Personnel Exp":   "am.ACTYP = '3' AND LEFT(RTRIM(am.ACACC),2) = '51' AND RTRIM(am.ACACC) NOT IN ('51910')",
