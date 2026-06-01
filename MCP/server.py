@@ -192,10 +192,18 @@ async def income_statement(
     branch: str | None = None,
     detail: str = "summary",
 ) -> str:
-    """Return a P&L for the given period from v_IncomeStatementLines.
+    """Return a P&L for the given period from v_IncomeStatementLines (CLOSED PERIODS ONLY).
+
+    IMPORTANT — this tool only works for periods Crystal has formally closed
+    on the source (currently through 2026-02). For ANY month after the last
+    closed period (e.g. April 2026, May 2026, June 2026), use `pnl_through`
+    instead — it rolls YTDJRL journal-line postings forward to your target
+    date. Do NOT respond "no data for that month" — that's the wrong answer;
+    the journal-line table HAS the data, you just need the right tool.
 
     Args:
-        period: 'YYYY-MM', 'YYYY-MM-DD', or 'YYYYMM' (e.g. '2025-04' or 202504)
+        period: 'YYYY-MM', 'YYYY-MM-DD', or 'YYYYMM' (e.g. '2025-04' or 202504).
+                Must be a closed period. Use `period_coverage` to check what's closed.
         company: optional 2-char company code (e.g. '01')
         division: optional 2-char division code
         branch: optional branch code
@@ -255,6 +263,98 @@ async def income_statement(
             "filters": {"company": company, "division": division, "branch": branch},
         },
     )
+
+
+@mcp.tool()
+async def pnl_through(
+    through: int,
+    branch: str | None = None,
+    detail: str = "summary",
+) -> str:
+    """P&L for any date — works for unclosed periods (April, May, etc.).
+
+    USE THIS WHEN: the user asks for a P&L / income statement for any month
+    that isn't fully closed in GLCAL (anything after the latest
+    `period_coverage` closed period). YTDJRL has per-day journal-line
+    postings — this tool rolls them forward from year-start to `through`
+    so you can answer "what did April look like?" or "P&L through 5/15?".
+
+    DO NOT respond to month-X P&L questions with "GLCAL doesn't have that
+    period" or "no rows in v_IncomeStatementLines" — those queries return
+    empty for unclosed months but the underlying data IS in dbo.YTDJRL.
+
+    Args:
+        through: YYYYMMDD upper bound (e.g. 20260430 = "through April 30 2026").
+                 Anything from 20190129 (earliest YTDJRL data) up to today works.
+        branch: optional 2-digit branch suffix (e.g. '14' for Tallahassee)
+        detail: 'summary' (one row per high-level section: Revenue / COGS /
+                Variable / Personnel / Operating / Fixed / D&A / Interest / Other)
+                or 'by_account' (one row per GL account)
+
+    Year-to-date scope: always year-start (Jan 1) of the year embedded in
+    `through` up to `through` itself. For a single-month view, subtract
+    two pnl_through calls (e.g. April-only = through(20260430) − through(20260331)).
+    """
+    try:
+        thru = int(through)
+        year = thru // 10000
+        year_start = year * 10000 + 101
+    except (TypeError, ValueError):
+        return json.dumps({"error": True, "message": "through must be YYYYMMDD int"})
+
+    branch_filter = "AND RIGHT(RTRIM(y.YJ_CC),2) = ?" if branch else ""
+    params = (branch.strip(),) if branch else ()
+
+    if detail == "summary":
+        sql = f"""
+        WITH lines AS (
+          SELECT
+            CASE
+              WHEN am.ACTYP='2' AND LEFT(RTRIM(am.ACACC),1)='3' AND am.ACACC NOT IN ('42210','42005','42212') THEN 'Revenue'
+              WHEN am.ACTYP='2' AND LEFT(RTRIM(am.ACACC),1)='4' AND am.ACACC NOT IN ('42210','42005','42212') THEN 'COGS'
+              WHEN RTRIM(am.ACACC) = '51910' THEN 'Variable Expense'
+              WHEN am.ACTYP='3' AND LEFT(RTRIM(am.ACACC),2) = '51' AND RTRIM(am.ACACC) <> '51910' THEN 'Personnel'
+              WHEN am.ACTYP='3' AND LEFT(RTRIM(am.ACACC),2) IN ('52','53','54','56','57','58')
+                   AND RTRIM(am.ACACC) NOT IN ('58200','58290','58310','55100','55300','55400') THEN 'Operating'
+              WHEN am.ACTYP='3' AND LEFT(RTRIM(am.ACACC),3) = '590' THEN 'Fixed'
+              WHEN RTRIM(am.ACACC) IN ('55100','55300','55400') THEN 'D&A'
+              WHEN RTRIM(am.ACACC) IN ('58200','58290','59100') THEN 'Interest'
+              WHEN am.ACTYP IN ('2','3') AND LEFT(RTRIM(am.ACACC),1) IN ('6','7') THEN 'Other Inc/Exp'
+              ELSE 'Unclassified'
+            END AS Section,
+            y.YJ_AMT
+          FROM dbo.YTDJRL y JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = RTRIM(y.YJ_ACC)
+          WHERE am.ACTYP IN ('2','3') AND y.YJ_DT BETWEEN {year_start} AND {thru}
+                {branch_filter}
+        )
+        SELECT Section, COUNT(*) AS Lines, -SUM(YJ_AMT) AS NetIncomeImpact
+        FROM lines GROUP BY Section ORDER BY Section
+        """
+    elif detail == "by_account":
+        sql = f"""
+        SELECT RTRIM(y.YJ_ACC) AS AccountNumber,
+               LEFT(RTRIM(am.ACNME), 40) AS AccountName,
+               am.ACTYP, COUNT(*) AS Lines,
+               -SUM(y.YJ_AMT) AS NetIncomeImpact
+        FROM dbo.YTDJRL y JOIN dbo.ACCMAST am ON RTRIM(am.ACACC) = RTRIM(y.YJ_ACC)
+        WHERE am.ACTYP IN ('2','3') AND y.YJ_DT BETWEEN {year_start} AND {thru}
+              {branch_filter}
+        GROUP BY y.YJ_ACC, am.ACNME, am.ACTYP
+        HAVING SUM(y.YJ_AMT) <> 0
+        ORDER BY ABS(SUM(y.YJ_AMT)) DESC
+        """
+    else:
+        return json.dumps({"error": True, "message": "detail must be 'summary' or 'by_account'"})
+
+    r = _exec(sql, params)
+    if r.get("error"):
+        return json.dumps(r, default=str)
+    return _result_to_text(r, extra_meta={
+        "through": thru,
+        "year_start": year_start,
+        "branch": branch,
+        "source": "dbo.YTDJRL roll-forward (works for unclosed periods)",
+    })
 
 
 @mcp.tool()
@@ -569,7 +669,18 @@ async def alias_rollup(
 
 @mcp.tool()
 async def period_coverage(company: str | None = None) -> str:
-    """Period coverage in GLCAL — min, max, count, plus the 12 most recent periods."""
+    """Period coverage in GLCAL — min, max, count, plus the 12 most recent periods.
+
+    Important: GLCAL only contains CLOSED periods. The 'MaxPeriod' returned
+    here is the latest period Crystal has formally closed on the source.
+    Periods after that (e.g. current and next few months) have no GLCAL rows.
+
+    For unclosed-period reporting (a P&L or balance sheet for April / May / etc.
+    when only Feb is closed), DO NOT report 'no data for that period'. Use:
+      - `pnl_through(through=YYYYMMDD)` for P&L through any date
+      - `balance_sheet_v2(through=YYYYMMDD)` for BS as of any date
+    Both roll forward YTDJRL journal-line postings, which extend through today.
+    """
     where: list = []
     params: list = []
     if company:
@@ -723,16 +834,28 @@ async def ap_analysis(period_from: str, period_to: str) -> str:
 @mcp.tool()
 async def balance_sheet_v2(period: str | None = None, through: int | None = None,
                             branch: str | None = None) -> str:
-    """Consolidated balance sheet section subtotals using v2 CFO layout.
+    """Balance sheet section subtotals — works for ANY date, including
+    months that are not yet closed in GLCAL.
+
+    Three modes (pick exactly one):
+      - through=YYYYMMDD → arbitrary as-of date (e.g. April 30 2026 even
+        though GLCAL only goes through Feb). Uses GLCAL last-closed-period
+        snapshot + YTDJRL postings rolled forward to the target date.
+        **USE THIS FOR ANY MONTH AFTER THE LAST CLOSED PERIOD.**
+      - period='YYYY-MM' → historical period-end via GLCAL (closed months only)
+      - neither → live current-state balances via COACMAST.CA_CUR
+        (always "as of latest source update", can't target a specific date)
+
+    DO NOT respond "no data for [month]" or "GLCAL doesn't have [period]" —
+    if the user asks for any date the journal-line table covers (2019-01
+    forward), use `through` and you'll get a balance sheet. The data IS there.
 
     Args:
-        period: 'YYYY-MM' or 'YYYYMM' for historical period-end via GLCAL.
-        through: YYYYMMDD for an arbitrary as-of date — uses GLCAL last-closed
-                 period before that date + YTDJRL postings rolled forward to it.
-        branch: optional 2-digit branch suffix (e.g. '14' for Tallahassee)
-
-    If neither period nor through is given, returns LIVE current-state balances
-    via COACMAST.CA_CUR (includes activity in periods that haven't closed yet).
+        period: 'YYYY-MM' or 'YYYYMM' for closed-period GLCAL snapshot
+        through: YYYYMMDD for roll-forward to arbitrary date (the right answer
+                 for "April balance sheet" when April isn't closed yet)
+        branch: optional 2-digit branch suffix (e.g. '14' for Tallahassee).
+                Use `branch_list` to translate names → codes.
 
     Returns section totals (Cash, AR, Inventory, PP&E, etc.). Run the CLI
     script (scripts/reports/balance_sheet.py) for the full PDF.
