@@ -12,14 +12,21 @@ Reference Intellidealer PDFs from Crystal: [`docs/intellidealer-reports/`](intel
 | Per-branch (CC suffix) total revenue, per-month (closed periods) | ✓ to the dollar | e.g. Chiefland Jan 2026 $702,028; Chiefland by dept all 4 columns match |
 | Per-DFS-dept (CC leading digit) totals | ✓ to the dollar | After fixing the dept-mapping bug — see commit `2dde14a` |
 | All-entities totals, closed periods, unfiltered | ✓ to the dollar | Jan 2026: $19,682,496 mine = Intellidealer exactly |
+| **All-entities totals, near-closed periods (April), once eliminations post** | ✓ to the dollar | April 2026: $26,749,403 both, verified 2026-06-01 once the HD intercompany eliminations completed |
 
 ## Six explained discrepancies
 
 Every diff we've observed has a clean cause. None are bugs in our data.
 
-### 1. April 2026 All Entities: $26.7M (Intellidealer) vs $32.7M (ours) → +$6M
+### 1. April 2026 All Entities: $26.7M (Intellidealer) vs $32.7M (ours) → +$6M — RESOLVED 2026-06-01
 
-**Cause:** Crystal posted ~$6M of back-dated April entries to the AS/400 source between Intellidealer's run on 5/9/26 and our most-recent ETL pull. Apr was still in active close on the source — our data is more current than Intellidealer's 5/9 snapshot.
+**Cause:** Crystal's "All Entities" report nets out Harley-Davidson intercompany activity. We were seeing the HD wholesale sales ($7.65M of "SlsNewHDTour / SlsUsedHD / SlsHDApparelGM" entries at CCs ending in 93, journal type `04HD`) before Crystal had posted the matching $5.99M intercompany elimination entries. Intellidealer's All Entities total has always shown the net-of-eliminations figure; we were pre-elimination because the entries hadn't propagated yet.
+
+**Resolution:** Between the original investigation (~2026-05-28) and 2026-06-01, the eliminations posted on the AS/400 source and our ETL caught up. Verified: April 2026 total revenue = **$26,749,403 in our YTDJRL = $26,749,403 in Intellidealer (exact)**.
+
+**Net wholesale CC=93 today:** 227 rows, $1.66M net (= $7.65M sales − $5.99M intercompany eliminations).
+
+**Lesson:** for active-close periods, expect our data to occasionally show pre-elimination figures that look "too high" until Crystal posts the eliminations. The eliminations come; the gap closes.
 
 ### 2. Per-account 1-3% diffs (e.g. Kubota Sales 32000 Jan)
 
