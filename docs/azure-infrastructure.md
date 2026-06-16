@@ -126,7 +126,7 @@ Password: ***SQL_PASSWORD_REDACTED***
 ```
 Server:   tcp:crystal-intellidealer-r1.database.windows.net,1433
 User:     crystalSQL
-Password: ***IDR1_SQL_PASSWORD_REDACTED***
+Password: ***IDR1_SQL_PASSWORD_REDACTED*** (fetch via `az`: see Credentials section)
 ```
 
 ⚠️ **Different year** from CrystalCares — password is `2024!` here, `2025!` on `crystalcares.database.windows.net`. Sourced from `CrystalTradeInFunctions` app setting `SQLServerConnectionString`.
