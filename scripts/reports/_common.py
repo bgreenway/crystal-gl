@@ -85,6 +85,22 @@ def fmt_int(v: Any) -> str:
     return f"{int(v):,}"
 
 
+def validate_branch(branch: str | None) -> str | None:
+    """Reject anything that isn't exactly 2 digits.
+
+    Branch codes are always 2 digits ('01'-'99'). Crystal's chart never has
+    a branch that doesn't fit that. Rejecting here means downstream SQL can
+    safely splice the value without parameterizing — there's no character
+    in a 2-digit string that needs escaping.
+    """
+    if branch is None or branch == "":
+        return None
+    import re
+    if not re.fullmatch(r"\d{2}", branch):
+        raise ValueError(f"branch must be exactly 2 digits, got {branch!r}")
+    return branch
+
+
 def fmt_period(p: int | str) -> str:
     """202602 -> 'Feb 2026'; 2025 -> '2025'."""
     s = str(p)
@@ -212,6 +228,7 @@ def bs_balance_through(through: int, branch: str | None) -> list[tuple[str, str,
 
     Returns list of (acct, name, balance) tuples.
     """
+    branch = validate_branch(branch)
     anchor = last_closed_period_on_or_before(through)  # YYYYMM
     anchor_eom = anchor * 100 + 31                     # safe upper bound for date math
     branch_glcal = f"AND RIGHT(RTRIM(g.GB_GLC),2) = '{branch}'" if branch else ""
@@ -255,6 +272,7 @@ def pnl_activity_through(through: int, branch: str | None, *, group_by_cc_digit:
              where line_kind is one of Revenue/COGS/Variable/Personnel/
              Operating/Fixed/DA/Interest/Other based on account.
     """
+    branch = validate_branch(branch)
     year = through // 10000
     year_start = year * 10000 + 101
     branch_yj = f"AND RIGHT(RTRIM(y.YJ_CC),2) = '{branch}'" if branch else ""
@@ -316,6 +334,7 @@ def pnl_activity_through(through: int, branch: str | None, *, group_by_cc_digit:
 
 def ytd_ni_through(through: int, branch: str | None) -> float:
     """YTD Net Income from YTDJRL postings between year-start and `through`."""
+    branch = validate_branch(branch)
     year = through // 10000
     year_start = year * 10000 + 101
     branch_yj = f"AND RIGHT(RTRIM(y.YJ_CC),2) = '{branch}'" if branch else ""

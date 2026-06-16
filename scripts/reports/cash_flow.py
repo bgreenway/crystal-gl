@@ -24,7 +24,7 @@ from reportlab.platypus import Paragraph, Spacer, TableStyle
 from _common import (
     BAND_GRAY, BRAND_BLUE, H1, H2, SMALL, SUB,
     bs_balance_through, fetch, fmt_money, make_doc, now_str,
-    pnl_activity_through, themed_table, ytd_ni_through,
+    pnl_activity_through, themed_table, validate_branch, ytd_ni_through,
 )
 
 # BS account groups for working-capital change calculations
@@ -70,6 +70,7 @@ def balance(period: int | None, accts: list[str], branch: str | None, *,
     period given (YYYYMM) → GLCAL period-end snapshot.
     both None → live snapshot via COACMAST.CA_CUR.
     """
+    branch = validate_branch(branch)
     if through is not None:
         from _common import last_closed_period_on_or_before
         anchor = last_closed_period_on_or_before(through)
@@ -111,6 +112,7 @@ def balance(period: int | None, accts: list[str], branch: str | None, *,
 
 def yearly_activity(year: int, accts: list[str], branch: str | None, *, live: bool = False) -> float:
     """Sum P&L activity for the year. live=True pulls from CA_CUR (includes open periods)."""
+    branch = validate_branch(branch)
     if live:
         where = [f"RTRIM(c.CA_ACC) IN ({','.join('?' for _ in accts)})"]
         if branch:
@@ -132,6 +134,7 @@ def yearly_activity(year: int, accts: list[str], branch: str | None, *, live: bo
 
 
 def ytd_ni(year: int, branch: str | None, *, live: bool = False) -> float:
+    branch = validate_branch(branch)
     if live:
         where = ["am.ACTYP IN ('2','3')"]
         if branch:
@@ -155,6 +158,7 @@ def ytd_ni(year: int, branch: str | None, *, live: bool = False) -> float:
 
 def build_pdf(year: int | None, through: int | None, branch: str | None, output_path: str) -> str:
     from datetime import date as _d
+    branch = validate_branch(branch)
     if through is not None:
         eff_year = through // 10000
         eoy_period = None

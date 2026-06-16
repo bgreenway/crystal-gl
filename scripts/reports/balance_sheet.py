@@ -24,7 +24,7 @@ from reportlab.lib import colors
 from _common import (
     BAND_GRAY, BRAND_BLUE, H1, H2, SMALL, SUB,
     bs_balance_through, fetch, fmt_money, make_doc, now_str,
-    themed_table, ytd_ni_through,
+    themed_table, validate_branch, ytd_ni_through,
 )
 
 SECTIONS_BS = [
@@ -66,6 +66,7 @@ def fetch_bs_balances_glcal(period: int, branch: str | None):
     GLCAL only updates when a month closes on the source, so 'latest' here
     means 'latest closed period' — typically a few months behind today.
     """
+    branch = validate_branch(branch)
     where = ["am.ACTYP = '1'", f"g.GB_DATE = {period}"]
     if branch:
         where.append(f"RIGHT(RTRIM(g.GB_GLC),2) = '{branch}'")
@@ -89,6 +90,7 @@ def fetch_bs_balances_live(branch: str | None):
     that haven't formally closed yet. This is what 'latest' should mean
     when a user asks for 'today's balance sheet'.
     """
+    branch = validate_branch(branch)
     where = ["am.ACTYP = '1'"]
     if branch:
         where.append(f"RIGHT(RTRIM(c.CA_CC),2) = '{branch}'")
@@ -127,6 +129,7 @@ def fetch_ytd_ni(year: int, branch: str | None, *, live: bool = False) -> float:
                  current-year flow including the open periods. This is what
                  should be added to RE when the BS source is COACMAST.CA_CUR.
     """
+    branch = validate_branch(branch)
     if live:
         where = ["am.ACTYP IN ('2','3')",
                  f"y.YJ_DT BETWEEN {year*10000 + 101} AND {year*10000 + 1231}"]

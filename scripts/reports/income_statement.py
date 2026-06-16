@@ -25,6 +25,7 @@ from reportlab.platypus import Paragraph, Spacer, TableStyle
 from _common import (
     BAND_GRAY, BODY, BRAND_BLUE, H1, H2, LINE_GRAY, SMALL, SUB,
     fetch, fmt_money, make_doc, now_str, pnl_activity_through, themed_table,
+    validate_branch,
 )
 
 # CFO-approved v2 section structure. Each section: list of (account, name).
@@ -81,6 +82,7 @@ def fetch_pnl_amounts(year: int | None, period: int | None, through: int | None,
       - else (default): COACMAST.CA_CUR — live YTD current year
     """
     from datetime import date as _d
+    branch = validate_branch(branch)
     if through is not None:
         return pnl_activity_through(through, branch, group_by_cc_digit=False)
     use_live = (period is None and (year is None or year == _d.today().year))

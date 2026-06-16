@@ -63,7 +63,10 @@ If a PDF-via-MCP transport is ever wanted, the cleanest path is publishing to Az
 
 ## Dependencies
 
-All in [`../../MCP/requirements.txt`](../../MCP/requirements.txt) (shared venv):
-- `pyodbc>=5.1.0` + ODBC Driver 18 for SQL Server
-- `azure-identity>=1.15.0`
-- `reportlab>=4.0` (PDF generation)
+Install from [`requirements.txt`](requirements.txt) (this directory):
+
+```sh
+pip install -r scripts/reports/requirements.txt
+```
+
+That covers `pyodbc>=5.1.0` (needs ODBC Driver 18 for SQL Server), `azure-identity>=1.15.0`, and `reportlab>=4.0`. The MCP server (`MCP/requirements.txt`) does NOT depend on reportlab and is intentionally lighter.

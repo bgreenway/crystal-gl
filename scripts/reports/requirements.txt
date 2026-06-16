@@ -1,0 +1,7 @@
+# Crystal GL report generators (scripts/reports/*.py).
+# The MCP server (MCP/requirements.txt) does NOT need reportlab; only the
+# local PDF-generating CLI scripts do. Install with:
+#   pip install -r scripts/reports/requirements.txt
+pyodbc>=5.1.0
+azure-identity>=1.15.0
+reportlab>=4.0

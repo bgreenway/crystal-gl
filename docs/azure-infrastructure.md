@@ -338,22 +338,34 @@ Public unauthenticated endpoint: `GET /healthz` → `{"status":"ok"}`.
 
 ## Credentials catalog
 
-All secrets gathered or generated during work, in one place:
+**All values previously listed here were treated as burned and removed 2026-06-04 after a code review flagged them. The values below are App Service setting names (where the real secrets live) and Azure CLI commands to read them when needed.** If you cloned this repo before that date, rotate every secret named here.
 
-| What | Value |
-|------|-------|
-| **CrystalCares SQL** | `crystalSQL` / `***SQL_PASSWORD_REDACTED***` |
-| **MCP static bearer** | `***MCP_BEARER_REDACTED***` |
-| **MCP OAuth passcode** | `***OAUTH_PASSCODE_REDACTED***` (typed at the claude.ai /authorize popup) |
-| **MCP JWT secret** | `***MCP_JWT_REDACTED***` |
-| **Azure AD** | `brad.greenway@me.com` (interactive via `az login`) |
+| What | Where the value lives |
+|------|----------------------|
+| CrystalCares SQL admin password | `az webapp config appsettings list --name crystalcares-mcp --resource-group CrystalCaresDev --query "[?name=='SQL_ADMIN_PASSWORD'].value" -o tsv` (or pull from Key Vault if migrated) |
+| MCP static bearer | App Service setting `MCP_BEARER_TOKEN` on each MCP app |
+| MCP OAuth passcode | App Service setting `OAUTH_PASSCODE` on each MCP app |
+| MCP JWT signing secret | App Service setting `MCP_JWT_SECRET` on each MCP app |
+| Azure AD | Interactive via `az login` (no static value) |
 
-Rotate any of the MCP secrets via:
+**Rotation procedure** (run after any suspected compromise):
+
 ```bash
-NEW=$(C:/Python312/python.exe -c "import secrets; print(secrets.token_urlsafe(48))")
-az webapp config appsettings set --name crystalcares-mcp --resource-group CrystalCaresDev \
-  --settings MCP_BEARER_TOKEN="$NEW"  # or OAUTH_PASSCODE, or MCP_JWT_SECRET
+APP=crystal-gl-mcp                 # or crystalcares-mcp
+RG=CrystalCaresDev
+NEW_BEARER=$(python3 -c "import secrets; print(secrets.token_urlsafe(48))")
+NEW_PASSCODE=$(python3 -c "import secrets; print(secrets.token_urlsafe(12))")
+NEW_JWT=$(python3 -c "import secrets; print(secrets.token_urlsafe(48))")
+az webapp config appsettings set --name "$APP" --resource-group "$RG" --settings \
+  MCP_BEARER_TOKEN="$NEW_BEARER" \
+  OAUTH_PASSCODE="$NEW_PASSCODE" \
+  MCP_JWT_SECRET="$NEW_JWT"
+# distribute the new bearer/passcode out-of-band to authorized callers
 ```
+
+**Next-step hardening (deferred):**
+- Migrate all MCP secrets to Key Vault, reference via `@Microsoft.KeyVault(...)` in App Service settings so the values never appear in `az webapp config appsettings list` output
+- Migrate the SQL admin password the same way (currently stored in App Service settings as plaintext)
 
 ---
 

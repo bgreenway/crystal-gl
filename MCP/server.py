@@ -109,7 +109,12 @@ def _conn():
 
 
 def _exec(sql: str, params: tuple = ()) -> dict:
-    """Run a SELECT and return {'columns', 'rows', 'meta'} or {'error', 'message'}."""
+    """Run a SELECT and return {'columns', 'rows', 'meta'} or {'error', 'message'}.
+
+    Row cap: uses fetchmany(SQL_MAX_ROWS + 1) so a runaway query doesn't
+    fetch millions of rows into memory before the cap can fire. The +1 is
+    so we can tell whether truncation actually happened.
+    """
     t0 = time.time()
     rows: list = []
     cols: list = []
@@ -122,11 +127,11 @@ def _exec(sql: str, params: tuple = ()) -> dict:
             cur.execute(sql, params)
             if cur.description:
                 cols = [c[0] for c in cur.description]
-                for i, r in enumerate(cur.fetchall()):
-                    if i >= SQL_MAX_ROWS:
-                        truncated = True
-                        break
-                    rows.append(tuple(r))
+                batch = cur.fetchmany(SQL_MAX_ROWS + 1)
+                if len(batch) > SQL_MAX_ROWS:
+                    truncated = True
+                    batch = batch[:SQL_MAX_ROWS]
+                rows = [tuple(r) for r in batch]
         finally:
             conn.close()
     except Exception as e:
@@ -159,6 +164,20 @@ def _result_to_text(result: dict, extra_meta: dict | None = None, max_chars: int
 
 # ---- Period parsing ----
 _PERIOD_RX = re.compile(r"^(?:(\d{4})-?(\d{2})(?:-\d{2})?|(\d{6}))$")
+_BRANCH_RX = re.compile(r"^\d{2}$")
+
+
+def _validate_branch(branch: Any) -> str | None:
+    """Branch must be exactly 2 digits. Splicing anything else into SQL is
+    refused. Returns the normalized (stripped) value or None."""
+    if branch is None:
+        return None
+    s = str(branch).strip()
+    if s == "":
+        return None
+    if not _BRANCH_RX.fullmatch(s):
+        raise ValueError(f"branch must be exactly 2 digits, got {branch!r}")
+    return s
 
 
 def _parse_period(p: Any) -> int:
@@ -211,6 +230,7 @@ async def income_statement(
     """
     try:
         per = _parse_period(period)
+        branch = _validate_branch(branch)
     except ValueError as e:
         return json.dumps({"error": True, "message": str(e)})
 
@@ -224,7 +244,7 @@ async def income_statement(
         params.append(division.strip().zfill(2))
     if branch:
         where.append("Branch = ?")
-        params.append(branch.strip())
+        params.append(branch)
     where_sql = " AND ".join(where)
 
     if detail == "summary":
@@ -299,11 +319,12 @@ async def pnl_through(
         thru = int(through)
         year = thru // 10000
         year_start = year * 10000 + 101
-    except (TypeError, ValueError):
-        return json.dumps({"error": True, "message": "through must be YYYYMMDD int"})
+        branch = _validate_branch(branch)
+    except (TypeError, ValueError) as e:
+        return json.dumps({"error": True, "message": str(e) or "through must be YYYYMMDD int"})
 
     branch_filter = "AND RIGHT(RTRIM(y.YJ_CC),2) = ?" if branch else ""
-    params = (branch.strip(),) if branch else ()
+    params = (branch,) if branch else ()
 
     if detail == "summary":
         sql = f"""
@@ -860,6 +881,11 @@ async def balance_sheet_v2(period: str | None = None, through: int | None = None
     Returns section totals (Cash, AR, Inventory, PP&E, etc.). Run the CLI
     script (scripts/reports/balance_sheet.py) for the full PDF.
     """
+    try:
+        branch = _validate_branch(branch)
+    except ValueError as e:
+        return json.dumps({"error": True, "message": str(e)})
+
     if through is not None:
         # YTDJRL roll-forward: anchor = latest GLCAL closed period < through, plus
         # YTDJRL postings between that period-end and `through`.
@@ -961,7 +987,7 @@ async def balance_sheet_v2(period: str | None = None, through: int | None = None
         HAVING SUM(c.CA_CUR) <> 0
         ORDER BY Balance DESC
         """
-        r = _exec(sql, (branch.strip(),) if branch else ())
+        r = _exec(sql, (branch,) if branch else ())
         return _result_to_text(r, extra_meta={"mode": "live", "source": "COACMAST.CA_CUR", "branch": branch})
 
     try:
@@ -1001,7 +1027,7 @@ async def balance_sheet_v2(period: str | None = None, through: int | None = None
     HAVING SUM(g.GB_AMT) <> 0
     ORDER BY Balance DESC
     """
-    r = _exec(sql, (branch.strip(),) if branch else ())
+    r = _exec(sql, (branch,) if branch else ())
     return _result_to_text(r, extra_meta={"period": per, "branch": branch})
 
 
@@ -1020,6 +1046,10 @@ async def cash_flow(year: int | None = None, through: int | None = None,
     working-capital, investing, and financing breakdowns.
     """
     from datetime import date as _date
+    try:
+        branch = _validate_branch(branch)
+    except ValueError as e:
+        return json.dumps({"error": True, "message": str(e)})
     if through is not None:
         year = int(through) // 10000  # year derived from through date
     elif year is None:
@@ -1028,7 +1058,7 @@ async def cash_flow(year: int | None = None, through: int | None = None,
     eoy = year * 100 + 12
     branch_filter = "AND RIGHT(RTRIM(g.GB_GLC),2) = ?" if branch else ""
     branch_filter_y = "AND RIGHT(RTRIM(y.YJ_CC),2) = ?" if branch else ""
-    params = (branch.strip(),) if branch else ()
+    params = (branch,) if branch else ()
     cash_accts = "'10100','10110','10113','10114','10140','10150','10151','10160','10170'"
     da_accts = "'55100','55300','55400'"
     year_start = year * 10000 + 101
@@ -1200,10 +1230,18 @@ async def dfs_departmental(year: int | None = None) -> str:
 # =============================================================================
 
 _SQL_FORBIDDEN = re.compile(
-    r"\b(insert|update|delete|merge|drop|alter|create|truncate|exec|execute|grant|revoke)\b",
+    # SELECT ... INTO ... creates a table without ever using CREATE, so we
+    # forbid INTO too. OPENROWSET/OPENQUERY/OPENDATASOURCE can read or write
+    # arbitrary external sources. BULK / BACKUP / RESTORE / KILL / SHUTDOWN /
+    # USE round it out. This is defense in depth — the real boundary should
+    # be the DB principal having db_datareader only.
+    r"\b(insert|update|delete|merge|drop|alter|create|truncate|exec|execute|"
+    r"grant|revoke|into|openrowset|openquery|opendatasource|"
+    r"bulk|backup|restore|kill|shutdown|use)\b",
     re.IGNORECASE,
 )
-_SQL_FORBIDDEN_PREFIX = re.compile(r"\b(xp_|sp_)\w+", re.IGNORECASE)
+# xp_/sp_ are SQL Server system procs; fn_ are system functions. Block all.
+_SQL_FORBIDDEN_PREFIX = re.compile(r"\b(xp_|sp_|fn_)\w+", re.IGNORECASE)
 _SQL_ALLOWED_START = re.compile(r"^\s*(--[^\n]*\n|\s)*(select|with)\b", re.IGNORECASE)
 
 
@@ -1229,6 +1267,13 @@ async def query_sql(sql: str, limit: int = 100) -> str:
     Args:
         sql: a single SELECT or WITH...SELECT statement
         limit: row cap (default 100, max 10000); TOP injected for plain SELECTs
+               (not for WITH...SELECT — wrap your final SELECT with TOP yourself)
+
+    Read-only enforcement: keyword block-list (INSERT/UPDATE/DELETE/MERGE/DROP/
+    ALTER/CREATE/TRUNCATE/EXEC/GRANT/REVOKE/INTO/OPENROWSET/OPENQUERY/
+    OPENDATASOURCE/BULK/BACKUP/RESTORE/KILL/SHUTDOWN/USE) plus xp_/sp_/fn_
+    prefix block. The authoritative boundary is the DB principal's
+    permissions — this app should run as a db_datareader-only login.
     """
     limit = max(1, min(int(limit), 10000))
     s = sql.strip().rstrip(";")
@@ -1342,17 +1387,49 @@ async def oauth_protected_resource_metadata(_request):
     })
 
 
+_REDIRECT_URI_ALLOWLIST = [
+    u.strip() for u in os.environ.get(
+        "MCP_REDIRECT_URI_ALLOWLIST",
+        "https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback",
+    ).split(",") if u.strip()
+]
+
+
+def _redirect_uri_allowed(uri: str) -> bool:
+    """An exact match against MCP_REDIRECT_URI_ALLOWLIST. No prefix/regex —
+    OAuth open-redirect attacks routinely abuse loose matching."""
+    return bool(uri) and uri in _REDIRECT_URI_ALLOWLIST
+
+
 async def register_client(request):
     try:
         body = await request.json()
     except Exception:
         body = {}
+    requested = body.get("redirect_uris", []) or []
+    # Reject registration up-front if the client wants a URI we won't honor.
+    # This is the same allowlist /authorize will enforce, surfacing the error
+    # at client-registration time instead of at /authorize when the user has
+    # already started a flow.
+    bad = [u for u in requested if not _redirect_uri_allowed(u)]
+    if bad:
+        return JSONResponse({
+            "error": "invalid_redirect_uri",
+            "error_description": f"redirect_uri not in server allowlist: {bad}",
+        }, status_code=400)
     client_id = secrets.token_urlsafe(16)
-    _clients[client_id] = body
+    # Persist ONLY the allowlist-validated URIs — not the raw body — so an
+    # attacker can't slip an extra URI past us via key shadowing.
+    _clients[client_id] = {
+        "redirect_uris": requested,
+        "client_name": body.get("client_name"),
+        "client_uri": body.get("client_uri"),
+        "logo_uri": body.get("logo_uri"),
+    }
     return JSONResponse({
         "client_id": client_id,
         "client_id_issued_at": int(time.time()),
-        "redirect_uris": body.get("redirect_uris", []),
+        "redirect_uris": requested,
         "token_endpoint_auth_method": "none",
         "grant_types": ["authorization_code"],
         "response_types": ["code"],
@@ -1390,37 +1467,77 @@ _LOGIN_PAGE = """<!doctype html>
 </body></html>"""
 
 
+def _validate_authz_request(client_id: str, redirect_uri: str,
+                            code_challenge: str, code_challenge_method: str) -> str | None:
+    """Return None if the request is valid, or an error message string.
+
+    Enforces:
+      - client_id is registered (was issued via /register)
+      - redirect_uri matches one of the client's registered URIs
+      - redirect_uri is also on the server-wide allowlist (defense in depth)
+      - PKCE S256 is mandatory (no plain/none)
+    """
+    if not client_id or client_id not in _clients:
+        return "Unknown or unregistered client_id"
+    registered_uris = _clients[client_id].get("redirect_uris") or []
+    if not redirect_uri or redirect_uri not in registered_uris:
+        return "redirect_uri does not match a registered redirect URI for this client"
+    if not _redirect_uri_allowed(redirect_uri):
+        return "redirect_uri not in server-side allowlist"
+    if not code_challenge:
+        return "PKCE code_challenge is required"
+    if code_challenge_method != "S256":
+        return "PKCE code_challenge_method must be S256 (plain is not accepted)"
+    return None
+
+
 async def authorize(request):
     if request.method == "GET":
         params = request.query_params
         client_id = params.get("client_id", "")
         redirect_uri = params.get("redirect_uri", "")
-        if not redirect_uri:
-            return HTMLResponse("Missing redirect_uri", status_code=400)
+        code_challenge = params.get("code_challenge", "")
+        code_challenge_method = params.get("code_challenge_method", "S256")
+
+        err = _validate_authz_request(client_id, redirect_uri, code_challenge, code_challenge_method)
+        if err:
+            return HTMLResponse(f"Authorization request rejected: {html.escape(err)}", status_code=400)
+
         ctx = {
-            "client": html.escape(_clients.get(client_id, {}).get("client_name", client_id or "unknown")),
+            "client": html.escape(_clients[client_id].get("client_name") or client_id),
             "client_id": html.escape(client_id),
             "redirect_uri": html.escape(redirect_uri),
             "state": html.escape(params.get("state", "")),
-            "code_challenge": html.escape(params.get("code_challenge", "")),
-            "code_challenge_method": html.escape(params.get("code_challenge_method", "S256")),
+            "code_challenge": html.escape(code_challenge),
+            "code_challenge_method": html.escape(code_challenge_method),
             "scope": html.escape(params.get("scope", "mcp")),
             "err": "",
         }
         return HTMLResponse(_LOGIN_PAGE.format(**ctx))
 
     form = await request.form()
+    client_id = form.get("client_id", "")
+    redirect_uri = form.get("redirect_uri", "")
+    code_challenge = form.get("code_challenge", "")
+    code_challenge_method = form.get("code_challenge_method", "S256")
+
+    # Re-validate on POST — an attacker who skips the GET page should not
+    # be able to inject a different redirect_uri or skip PKCE.
+    err = _validate_authz_request(client_id, redirect_uri, code_challenge, code_challenge_method)
+    if err:
+        return HTMLResponse(f"Authorization request rejected: {html.escape(err)}", status_code=400)
+
     expected = os.environ.get("OAUTH_PASSCODE", "")
     if not expected:
         return HTMLResponse("Server misconfigured: OAUTH_PASSCODE not set", status_code=500)
     if not secrets.compare_digest(str(form.get("passcode", "")), expected):
         ctx = {
-            "client": html.escape(form.get("client_id") or "unknown"),
-            "client_id": html.escape(form.get("client_id", "")),
-            "redirect_uri": html.escape(form.get("redirect_uri", "")),
+            "client": html.escape(_clients[client_id].get("client_name") or client_id),
+            "client_id": html.escape(client_id),
+            "redirect_uri": html.escape(redirect_uri),
             "state": html.escape(form.get("state", "")),
-            "code_challenge": html.escape(form.get("code_challenge", "")),
-            "code_challenge_method": html.escape(form.get("code_challenge_method", "S256")),
+            "code_challenge": html.escape(code_challenge),
+            "code_challenge_method": html.escape(code_challenge_method),
             "scope": html.escape(form.get("scope", "mcp")),
             "err": '<div class="err">Invalid passcode.</div>',
         }
@@ -1429,15 +1546,14 @@ async def authorize(request):
     _cleanup_codes()
     code = secrets.token_urlsafe(32)
     _auth_codes[code] = {
-        "client_id": form.get("client_id", ""),
-        "redirect_uri": form.get("redirect_uri", ""),
-        "code_challenge": form.get("code_challenge", ""),
-        "code_challenge_method": form.get("code_challenge_method", "S256"),
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "code_challenge": code_challenge,
+        "code_challenge_method": code_challenge_method,
         "exp": time.time() + _AUTH_CODE_TTL,
         "sub": "user",
         "scope": form.get("scope", "mcp"),
     }
-    redirect_uri = form.get("redirect_uri") or ""
     state = form.get("state", "")
     sep = "&" if "?" in redirect_uri else "?"
     location = f"{redirect_uri}{sep}code={code}"
@@ -1457,8 +1573,22 @@ async def token_endpoint(request):
         return JSONResponse({"error": "invalid_grant", "error_description": "code expired or unknown"}, status_code=400)
     if record["exp"] < time.time():
         return JSONResponse({"error": "invalid_grant", "error_description": "code expired"}, status_code=400)
-    if record["redirect_uri"] and record["redirect_uri"] != form.get("redirect_uri"):
+    # client_id binding — the token request MUST come from the same client
+    # that requested the code (RFC 6749 §4.1.3). Previously we did not check
+    # this, so a stolen code could be redeemed by any client_id.
+    submitted_client = form.get("client_id", "")
+    if submitted_client and submitted_client != record["client_id"]:
+        return JSONResponse({"error": "invalid_grant", "error_description": "client_id does not match the code"}, status_code=400)
+    # redirect_uri must match the value the code was issued for, AND must
+    # still be allow-listed (in case the allowlist was tightened after issue)
+    if record["redirect_uri"] != form.get("redirect_uri"):
         return JSONResponse({"error": "invalid_grant", "error_description": "redirect_uri mismatch"}, status_code=400)
+    if not _redirect_uri_allowed(record["redirect_uri"]):
+        return JSONResponse({"error": "invalid_grant", "error_description": "redirect_uri no longer allowed"}, status_code=400)
+    # PKCE S256 is mandatory; record["code_challenge_method"] was already
+    # validated as 'S256' in /authorize, but recheck here defensively.
+    if record.get("code_challenge_method") != "S256":
+        return JSONResponse({"error": "invalid_grant", "error_description": "PKCE method must be S256"}, status_code=400)
     if not _verify_pkce(form.get("code_verifier", ""), record["code_challenge"], record["code_challenge_method"]):
         return JSONResponse({"error": "invalid_grant", "error_description": "PKCE failed"}, status_code=400)
     return JSONResponse({
